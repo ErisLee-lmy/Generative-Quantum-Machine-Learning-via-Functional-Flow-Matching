@@ -8,13 +8,23 @@ import matplotlib.pyplot as plt
 sqrt2 = np.sqrt(2)
 
 class QSC:
-    def __init__(self, n_qubits:int, device_class="lightning.gpu", initial_state=None):
-        self.n_qubits = n_qubits
+    def __init__(self, n_qubits: int, num_layers: int = 20,
+                 device_class="lightning.gpu", initial_state=None):
+        """
+        多层 Haar Unitary Scrambling Circuit
 
-        # 如果用户传入 "default.qubit"，但系统支持 GPU，自动切换
+        Args:
+            n_qubits: 比特数
+            num_layers: Haar Unitary 层数
+            device_class: 量子模拟器后端
+            initial_state: 初始态（默认为 |000...0>）
+        """
+        self.n_qubits = n_qubits
+        self.num_layers = num_layers
+
+        # 自动检测 GPU
         if device_class == "default.qubit":
             try:
-                # 检查 lightning.gpu 是否可用
                 _ = qml.device("lightning.gpu", wires=n_qubits)
                 device_class = "lightning.gpu"
                 print("[INFO] GPU detected, using lightning.gpu backend for acceleration.")
@@ -24,14 +34,14 @@ class QSC:
         self.dev = qml.device(device_class, wires=n_qubits)
         self.initial_state = initial_state
         
-        # 在初始化时定义 QNode
+        # 定义 QNode
         @qml.qnode(self.dev)
         def qsc_circuit():
             self.input()
-            self.circuit()
+            self.circuit()  # 多层 Haar 随机 unitary
             return qml.state()
 
-        self.output = qsc_circuit  # 存为实例方法
+        self.output = qsc_circuit
 
     def input(self):
         """设置初始态"""
@@ -53,9 +63,10 @@ class QSC:
         return q
 
     def circuit(self):
-        """应用 Haar 随机 unitary 到量子电路"""
-        U = self.haar_random_unitary()
-        qml.QubitUnitary(U, wires=range(self.n_qubits))
+        """应用多层 Haar 随机 unitary"""
+        for _ in range(self.num_layers):
+            U = self.haar_random_unitary()
+            qml.QubitUnitary(U, wires=range(self.n_qubits))
 
 
 
