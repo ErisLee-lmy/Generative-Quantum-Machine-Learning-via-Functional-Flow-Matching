@@ -2,7 +2,6 @@ import pennylane as qml
 from pennylane import numpy as np
 import torch
 from torch import nn, optim
-
 # ----------- 检查并选择设备 -----------
 print("CUDA available:", torch.cuda.is_available())
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
