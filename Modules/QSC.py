@@ -3,13 +3,14 @@ import pennylane as qml
 from pennylane import numpy as qnp
 import numpy as np
 import matplotlib.pyplot as plt
+import time
+import math
 
 sqrt2 = np.sqrt(2)
-
 class QSC:
     def __init__(self, n_qubits: int, num_layers: int = 3,
                  device_class="lightning.gpu", initial_state=None, 
-                 notice=True, global_haar=False):
+                 notice=True, global_haar=True):
         self.n_qubits = n_qubits
         self.num_layers = num_layers
         self.initial_state = initial_state
@@ -73,7 +74,7 @@ class QSC:
     # 生成单比特 Haar 随机 SU(2) 门
     def random_single_qubit_unitary(self):
         """使用Euler角生成单比特Haar随机门"""
-        # Haar measure: beta ~ arccos(1-2u), alpha,gamma ~ uniform(0,2π)
+        # Haar measure: betax~ arccos(1-2u), alpha,gamma ~ uniform(0,2π)
         alpha = 2 * np.pi * np.random.rand()
         beta = np.arccos(1 - 2*np.random.rand())  # [0, π]
         gamma = 2 * np.pi * np.random.rand()
@@ -81,57 +82,51 @@ class QSC:
 
     def haar_random_unitary(self):
         """生成 Haar 随机 unitary 矩阵"""
-        dim = 2 ** self.n_qubits
+        if self.global_haar:
+            dim = 2**self.n_qubits
+        else:
+            dim = 4
         z = (np.random.randn(dim, dim) + 1j * np.random.randn(dim, dim)) / sqrt2
         q, r = np.linalg.qr(z)
         d = np.diagonal(r)
         ph = d / np.abs(d)
         q = q * ph
         return q
-    
+        
     def circuit(self):
-        """多层局部随机层: 随机单比特门 + 固定CNOT纠缠"""
+        """
+        若 global_haar 为 True，则直接使用全局 Haar unitary；
+        否则使用局部双比特 Haar 随机门，交错排列，堆叠 num_layers 层。
+        """
         if self.global_haar:
             U = self.haar_random_unitary()
             qml.QubitUnitary(U, wires=range(self.n_qubits))
         else:
-            for _ in range(self.num_layers):
-                # Step 1: 单比特随机门
-                for wire in range(self.n_qubits):
-                    alpha, beta, gamma = self.random_single_qubit_unitary()
-                    qml.RZ(alpha, wires=wire)
-                    qml.RY(beta, wires=wire)
-                    qml.RZ(gamma, wires=wire)
-
-                # Step 2: CNOT纠缠 (线性链)
-                for wire in range(self.n_qubits - 1):
-                    qml.CNOT(wires=[wire, wire + 1])
-
+            for layer in range(self.num_layers):
+                # 交错层：偶数层作用于 (0,1), (2,3), ...
+                #        奇数层作用于 (1,2), (3,4), ...
+                start = 0 if layer % 2 == 0 else 1
+                for i in range(start, self.n_qubits - 1, 2):
+                    U = self.haar_random_unitary()  # 2 qubits => 4-dim Hilbert space
+                    qml.QubitUnitary(U, wires=[i, i + 1])
 
 def frame_potential(qsc_class, num_samples=20, k=2):
-    """估计k阶frame potential, 用于评估接近Haar程度"""
+    """估计第 k 阶 frame potential, 用于评估输出态是否接近 Haar 分布"""
     states = []
-    unitaries = []
 
-    # 收集多个随机电路的unitary
     for _ in range(num_samples):
-        # 输出最终态向量（单位化的列）
         psi = qsc_class.output()
-        # 将其视为列向量嵌入unitary（只做比较用）
-        unitaries.append(np.outer(psi, np.conj(psi)))
+        states.append(psi)
 
-    # 计算 frame potential
     F = 0
     for i in range(num_samples):
         for j in range(num_samples):
-            # Tr(U_i^† U_j)
-            overlap = np.trace(np.dot(np.conjugate(unitaries[i].T), unitaries[j]))
+            # 计算 |<ψ_i|ψ_j>|^{2k}
+            overlap = np.vdot(states[i], states[j])  # <ψ_i|ψ_j>
             F += np.abs(overlap) ** (2 * k)
 
     F /= num_samples ** 2
     return F
-
-
 
 
 if "__main__" == __name__:
@@ -144,7 +139,7 @@ if "__main__" == __name__:
     
     # 归一化初始态
     initial_state = [i / np.linalg.norm(initial_state) for i in initial_state]
-    qsc = QSC(n_qubits=n_qubits, num_layers=3,device_class="default.qubit",initial_state=initial_state)
+    qsc = QSC(n_qubits=n_qubits, num_layers=3,device_class="default.qubit",initial_state=initial_state,global_haar=True)
     initial_state = qsc.process_initial_state()
     
     states_list = []
@@ -197,21 +192,40 @@ if "__main__" == __name__:
     ax.set_title("Bloch Sphere Representation for State Vector Input")
     plt.show()
     
+    
+    
     # 计算 frame potential
-    num_layers_list = range(1,20)
+    num_layers_list = range(2,10,1)
+    # O(t^10 n^2) is enough t = 2, n = n_qubits 
     frame_potential_list = []
+    n_qubits = 5
+    k = 2
     for num in num_layers_list:
-        qsc_sample = QSC(n_qubits=10,num_layers=num,notice=False)
-        F = frame_potential(qsc, num_samples=100, k=2)
+        time_start = time.time()
+        qsc_sample = QSC(n_qubits=n_qubits,num_layers=num,notice=False,global_haar=False)
+        F = frame_potential(qsc_sample, num_samples=100, k=k)
         frame_potential_list.append(F)
-
+        print(f"constructed QSC with {num} layers, frame potential: {F:.4e}, time: {time.time() - time_start:.2f}s")
+    
+    time_start = time.time()
+    qsc_global = QSC(n_qubits=n_qubits,num_layers=num,notice=False,global_haar=True)
+    F_global = frame_potential(qsc_global, num_samples=100, k=2)
+    
+    
+    
+    print(f"constructed QSC with global unitary transform, frame potential: {F_global:.4e}, time: {time.time() - time_start:.2f}s")
+    
+    F_2_haar = math.factorial(k) / ((2 ** n_qubits) * (2 ** n_qubits + 1))  # For k=2
     plt.figure()
-    plt.plot(num_layers_list,frame_potential_list,color = 'blue')
+    plt.plot(num_layers_list,frame_potential_list,color = 'blue',label='local layers')
     plt.scatter(num_layers_list,frame_potential_list,marker='o',color='red')
-    plt.title('number of layers VS frame potenrial for n_qubits = 10')
+    plt.axhline(y=F_global, color='r', linestyle='--',label = f'global Haar with F = {F_global:.3e}')
+    plt.axhline(y=F_2_haar, color='orange', linestyle='--',label = f'Ideal Haar distribution F = {F_2_haar:.3e}')
+    plt.title(f'number of layers VS frame potenrial for n_qubits = {n_qubits}')
     plt.xlabel('number of layers')
     plt.ylabel('frame potential')
     plt.grid()
+    plt.legend()
     plt.show()
     
 # %%
