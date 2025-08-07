@@ -1,38 +1,42 @@
 # %%
 import pennylane as qml
 from pennylane import numpy as qnp
-import numpy as np   # 标准 numpy 用于 QR 分解
+import numpy as np
 import matplotlib.pyplot as plt
 
 sqrt2 = np.sqrt(2)
 
 class QSC:
-    def __init__(self, n_qubits: int, num_layers: int = 3,initial_state=None,
-                 device_class="lightning.gpu",notice = True):
+    def __init__(self, n_qubits: int, num_layers: int = 3,
+                 device_class="lightning.gpu", initial_state=None, 
+                 notice=True, global_haar=False):
         self.n_qubits = n_qubits
         self.num_layers = num_layers
         self.initial_state = initial_state
+        self.global_haar = global_haar
+        self.notice = notice
+
         # 自动检测 GPU
         if device_class == "default.qubit":
             try:
                 _ = qml.device("lightning.gpu", wires=n_qubits)
                 device_class = "lightning.gpu"
-                if notice:
+                if self.notice:
                     print("[INFO] GPU detected, using lightning.gpu backend for acceleration.")
             except Exception:
-                if notice:
+                if self.notice:
                     print("[WARNING] lightning.gpu not available, falling back to default.qubit.")
 
         self.dev = qml.device(device_class, wires=n_qubits)
 
-        # 处理初始态（支持纯态或密度矩阵）
+        # 处理初始态
         self.initial_state = self.process_initial_state()
 
         # 定义 QNode
         @qml.qnode(self.dev)
         def qsc_circuit():
             self.input()
-            self.circuit()
+            self.circuit()   # 多层局部随机层
             return qml.state()  # 始终输出纯态向量
 
         self.output = qsc_circuit
@@ -41,29 +45,22 @@ class QSC:
         """将输入处理为纯态向量"""
         dim = 2 ** self.n_qubits
         state = self.initial_state
-        # 情况 1: 输入 None → 默认 |000...0>
         if state is None:
             vec = qnp.zeros(dim)
             vec[0] = 1.0
             return vec
 
-        # 情况 2: 输入是向量 → 检查归一化
         state = np.array(state)
         if state.ndim == 1:
-            # 纯态向量
             norm = np.linalg.norm(state)
             if not np.isclose(norm, 1):
                 state = state / norm
             return qnp.array(state, dtype=complex)
 
-        # 情况 3: 输入是密度矩阵
         if state.ndim == 2:
-            # 检查是否纯态密度矩阵 (rank=1)
             eigvals, eigvecs = np.linalg.eigh(state)
-            # 取最大特征值对应的特征向量
             max_idx = np.argmax(eigvals)
             pure_vec = eigvecs[:, max_idx]
-            # 归一化
             pure_vec = pure_vec / np.linalg.norm(pure_vec)
             return qnp.array(pure_vec, dtype=complex)
 
@@ -72,6 +69,15 @@ class QSC:
     def input(self):
         """加载纯态向量"""
         qml.StatePrep(self.initial_state, wires=range(self.n_qubits))
+
+    # 生成单比特 Haar 随机 SU(2) 门
+    def random_single_qubit_unitary(self):
+        """使用Euler角生成单比特Haar随机门"""
+        # Haar measure: beta ~ arccos(1-2u), alpha,gamma ~ uniform(0,2π)
+        alpha = 2 * np.pi * np.random.rand()
+        beta = np.arccos(1 - 2*np.random.rand())  # [0, π]
+        gamma = 2 * np.pi * np.random.rand()
+        return alpha, beta, gamma
 
     def haar_random_unitary(self):
         """生成 Haar 随机 unitary 矩阵"""
@@ -82,12 +88,25 @@ class QSC:
         ph = d / np.abs(d)
         q = q * ph
         return q
-
+    
     def circuit(self):
-        """应用多层 Haar 随机 unitary"""
-        for _ in range(self.num_layers):
+        """多层局部随机层: 随机单比特门 + 固定CNOT纠缠"""
+        if self.global_haar:
             U = self.haar_random_unitary()
             qml.QubitUnitary(U, wires=range(self.n_qubits))
+        else:
+            for _ in range(self.num_layers):
+                # Step 1: 单比特随机门
+                for wire in range(self.n_qubits):
+                    alpha, beta, gamma = self.random_single_qubit_unitary()
+                    qml.RZ(alpha, wires=wire)
+                    qml.RY(beta, wires=wire)
+                    qml.RZ(gamma, wires=wire)
+
+                # Step 2: CNOT纠缠 (线性链)
+                for wire in range(self.n_qubits - 1):
+                    qml.CNOT(wires=[wire, wire + 1])
+
 
 def frame_potential(qsc_class, num_samples=20, k=2):
     """估计k阶frame potential, 用于评估接近Haar程度"""
