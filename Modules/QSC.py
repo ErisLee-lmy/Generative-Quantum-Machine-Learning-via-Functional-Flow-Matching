@@ -3,6 +3,8 @@ import pennylane as qml
 from pennylane import numpy as qnp
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.stats import kstest
+from scipy.stats import beta as Beta
 import time
 import math
 
@@ -92,6 +94,8 @@ class QSC:
         ph = d / np.abs(d)
         q = q * ph
         return q
+    
+
         
     def circuit(self):
         """
@@ -110,7 +114,18 @@ class QSC:
                     U = self.haar_random_unitary()  # 2 qubits => 4-dim Hilbert space
                     qml.QubitUnitary(U, wires=[i, i + 1])
 
-def frame_potential(qsc_class, num_samples=20, k=2):
+
+def haar_random_state(d):
+    """
+    返回长度 d 的复列向量 psi，满足 ||psi||=1。该方法：复高斯向量归一化，
+    等价于从 U(d) 的 Haar measure 抽取列向量。
+    """
+    z = (np.random.randn(d) + 1j * np.random.randn(d)) / np.sqrt(2)
+    z = z.astype(np.complex128)
+    psi = z / np.linalg.norm(z)
+    return psi  # 1D complex numpy array
+
+def frame_potential(qsc_class, num_samples=400, k=2):
     """估计第 k 阶 frame potential, 用于评估输出态是否接近 Haar 分布"""
     states = []
 
@@ -127,6 +142,24 @@ def frame_potential(qsc_class, num_samples=20, k=2):
 
     F /= num_samples ** 2
     return F
+
+def ks_test_haar(qsc_class, num_samples=200):
+    """
+    KS 检验：比较输出态的概率分布与 Haar 理论分布（Beta(1, d-1)）的一致性
+    返回 KS 统计量 和 p 值
+    """
+    d = 2 ** qsc_class.n_qubits
+    probs_all = []
+
+    for _ in range(num_samples):
+        psi = qsc_class.output()
+        psi = psi / np.linalg.norm(psi)  # 归一化
+        probs = np.abs(psi) ** 2
+        probs_all.extend(probs)  # 收集所有幅度的模平方
+
+    # Haar 边际分布是 Beta(1, d-1)
+    ks_stat, p_val = kstest(probs_all, Beta(a=1, b=d-1).cdf)
+    return ks_stat, p_val
 
 
 if "__main__" == __name__:
@@ -192,13 +225,45 @@ if "__main__" == __name__:
     ax.set_title("Bloch Sphere Representation for State Vector Input")
     plt.show()
     
-    
+    # KS 测试 Local vs Global Haar
+    n_qubits = 6
+    num_layers_list = range(2, 30, 1)
+    ks_stat_list = []
+    p_val_list = []
+
+    for num in num_layers_list:
+        time_start = time.time()
+        qsc_sample = QSC(n_qubits=n_qubits, num_layers=num, notice=False, global_haar=False)
+        ks_stat, p_val = ks_test_haar(qsc_sample, num_samples=200)
+        ks_stat_list.append(ks_stat)
+        p_val_list.append(p_val)
+        print(f"[Local] layers={num}, KS stat={ks_stat:.4f}, p={p_val:.4e}, time={time.time()-time_start:.2f}s")
+
+    # Global Haar
+    time_start = time.time()
+    qsc_global = QSC(n_qubits=n_qubits, num_layers=1, notice=False, global_haar=True)
+    ks_stat_global, p_val_global = ks_test_haar(qsc_global, num_samples=200)
+    print(f"[Global] KS stat={ks_stat_global:.4f}, p={p_val_global:.4e}, time={time.time()-time_start:.2f}s")
+
+    # 理论参考
+    print(f"Ideal Haar p-value 理论上应接近 1.0 (表示无法拒绝分布一致假设)")
+
+    # 绘图
+    plt.figure()
+    plt.plot(num_layers_list, ks_stat_list, color='blue', label='Local KS statistic')
+    plt.scatter(num_layers_list, ks_stat_list, marker='o', color='red')
+    plt.axhline(y=ks_stat_global, color='green', linestyle='--', label=f'Global KS stat = {ks_stat_global:.3f}')
+    plt.title(f"KS Statistic vs Number of Local Layers (n_qubits={n_qubits})")
+    plt.xlabel('Number of Local Layers')
+    plt.ylabel('KS Statistic (lower is better)')
+    plt.grid()
+    plt.legend()
+    plt.show()
     
     # 计算 frame potential
-    num_layers_list = range(2,10,1)
     # O(t^10 n^2) is enough t = 2, n = n_qubits 
     frame_potential_list = []
-    n_qubits = 5
+
     k = 2
     for num in num_layers_list:
         time_start = time.time()
@@ -227,5 +292,8 @@ if "__main__" == __name__:
     plt.grid()
     plt.legend()
     plt.show()
+    
+    
+
     
 # %%
