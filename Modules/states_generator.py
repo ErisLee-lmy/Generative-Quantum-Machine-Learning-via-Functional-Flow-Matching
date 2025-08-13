@@ -39,7 +39,5 @@ class Brickwork:
             return qml.state()
         
         self.output = circuit()
-
-if __name__ == "__main__":
     
 # %%
