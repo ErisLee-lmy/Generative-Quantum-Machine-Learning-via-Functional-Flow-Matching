@@ -15,10 +15,10 @@ import os
 import time
 
 class QFM(nn.Module):
-    def __init__(self, input_samples, target_samples, device_class="default.qubit",
+    def __init__(self, input_samples = None, target_samples = None, device_class="default.qubit",
                  num_ancilla = 2, num_layers = 4,
                  t_max = 1.0, num_steps = 20,
-                 learning_rate=0.01 , num_epochs=1000, notice=False):
+                 learning_rate=0.01 , num_epochs=100, notice=False):
 
         super().__init__()
 
@@ -82,20 +82,8 @@ class QFM(nn.Module):
         self.batch_size = int(self.input_samples.shape[0])
 
         # system dimension
-        self.d_sys = 2 ** self.num_qubits
+        self.d_sys = int(self.input_samples.shape[1])
 
-        # build empirical density matrices rho0, rho1 (torch complex on device)
-        rho0 = torch.zeros((self.d_sys, self.d_sys), dtype=self.cfloat, device=self.device)
-        rho1 = torch.zeros((self.d_sys, self.d_sys), dtype=self.cfloat, device=self.device)
-        for i in range(self.batch_size):
-            psi0 = self.input_samples[i].reshape(self.d_sys, 1)
-            psi1 = self.target_samples[i].reshape(self.d_sys, 1)
-            rho0 = rho0 + psi0 @ psi0.conj().transpose(-2, -1)
-            rho1 = rho1 + psi1 @ psi1.conj().transpose(-2, -1)
-        rho0 = rho0 / float(self.batch_size)
-        rho1 = rho1 / float(self.batch_size)
-        self.rho0 = rho0
-        self.rho1 = rho1
 
         # --- variational parameters ---
         # allocate parameters for system + ancilla wires
@@ -143,7 +131,7 @@ class QFM(nn.Module):
 
             # ancilla part if any
             if self.num_ancilla > 0:
-                for idx, w in enumerate(range(ancilla_start, ancilla_end)):
+                for w in range(ancilla_start, ancilla_end):
                     qml.RX(params[i, w, 0], wires=w)
                     qml.RY(params[i, w, 1], wires=w)
                     qml.RZ(params[i, w, 2], wires=w)
@@ -239,112 +227,147 @@ class QFM(nn.Module):
     # ------------------------------
     # Torch-based Quantum Sinkhorn (GPU-capable)
     # ------------------------------
-    def QuantumSkinhorn(self, epsilon=1e-2, max_iter_sinkhorn=200, tol_sinkhorn=1e-6):
+    def QuantumSkinhorn(self, epsilon=1e-2, max_iter_sinkhorn=200, tol_sinkhorn=1e-6, mu_reg=1e-6):
         """
-        Torch-friendly approximate Quantum Sinkhorn.
-        Returns:
-            L_list: list of torch.Tensor (d^2 x d^2)
-            Gamma_list: list of torch.Tensor (d^2 x d^2)
-            rho_ts: list of torch.Tensor (d x d)
-        """
-        device = self.device
-        dtype = self.cfloat
-        d = self.d_sys
-        rho0 = self.rho0
-        rho1 = self.rho1
+        Torch-friendly batched Quantum Sinkhorn.
+        All time intervals are processed in parallel on GPU.
 
+        Returns:
+            L_list: list of torch.Tensor, shape (N, d^2, d^2)
+            Gamma_list: list of torch.Tensor, shape (N, d^2, d^2)
+            rho_ts: list of torch.Tensor, shape (N+1, d, d)
+        """
+
+        device = self.device if hasattr(self, "device") else torch.device("cpu")
+        dtype = self.cfloat
+
+        # --- prepare states ---
+        x_in = self.input_samples
+        x_out = self.target_samples
+        if not isinstance(x_in, torch.Tensor):
+            x_in = torch.tensor(x_in, dtype=torch.get_default_dtype(), device=device)
+        if not isinstance(x_out, torch.Tensor):
+            x_out = torch.tensor(x_out, dtype=torch.get_default_dtype(), device=device)
+        if not torch.is_complex(x_in):
+            x_in = x_in.to(device).to(dtype=torch.cfloat)
+        if not torch.is_complex(x_out):
+            x_out = x_out.to(device).to(dtype=torch.cfloat)
+
+        batch_size, d = x_in.shape
+        d = int(d)
+
+        # empirical rho0, rho1
+        rho0 = torch.zeros((d, d), dtype=dtype, device=device)
+        rho1 = torch.zeros((d, d), dtype=dtype, device=device)
+        for i in range(batch_size):
+            psi0 = x_in[i].reshape(d, 1)
+            psi1 = x_out[i].reshape(d, 1)
+            rho0 += psi0 @ psi0.conj().t()
+            rho1 += psi1 @ psi1.conj().t()
+        rho0 = rho0 / batch_size
+        rho1 = rho1 / batch_size
+
+        # helper functions (batched)
         def herm(A):
             return 0.5 * (A + A.conj().transpose(-2, -1))
 
         def mat_log_torch(A, reg=1e-12):
             A = herm(A)
-            vals, vecs = torch.linalg.eigh(A + reg * torch.eye(A.shape[-1], dtype=A.dtype, device=device))
+            vals, vecs = torch.linalg.eigh(A + reg * torch.eye(A.shape[-1], dtype=A.dtype, device=A.device))
             vals = torch.clamp(vals, min=1e-15)
             lvals = torch.log(vals)
-            return (vecs * lvals.unsqueeze(0)) @ vecs.conj().transpose(-2, -1)
+            return (vecs * lvals.unsqueeze(-2)) @ vecs.conj().transpose(-2, -1)
 
         def mat_exp_torch(A):
             A = herm(A)
             vals, vecs = torch.linalg.eigh(A)
             evals = torch.exp(vals)
-            return (vecs * evals.unsqueeze(0)) @ vecs.conj().transpose(-2, -1)
+            return (vecs * evals.unsqueeze(-2)) @ vecs.conj().transpose(-2, -1)
 
-        # build SWAP operator on system⊗system (vectorized)
-        Id4 = torch.eye(d * d, dtype=dtype, device=device).reshape(d, d, d, d)
-        SWAP = Id4.permute(0, 3, 2, 1).reshape(d * d, d * d)
-        C = torch.eye(d * d, dtype=dtype, device=device) - SWAP
-
-        # kernel K
-        K = mat_exp_torch(-C / epsilon)
-
-        # partial traces
         def partial_trace_right(X):
-            X4 = X.reshape(d, d, d, d)
-            return torch.einsum('iaja->ij', X4)
+            # X: (B, d^2, d^2)
+            X4 = X.reshape(X.shape[0], d, d, d, d)
+            return torch.einsum('biajb->bij', X4)
 
         def partial_trace_left(X):
-            X4 = X.reshape(d, d, d, d)
-            return torch.einsum('iaib->ab', X4)
+            X4 = X.reshape(X.shape[0], d, d, d, d)
+            return torch.einsum('biaib->bab', X4)
 
-        # time grid interpolation between rho0 and rho1
+        # --- build cost kernel ---
+        SWAP = torch.zeros((d*d, d*d), dtype=dtype, device=device)
+        for i in range(d):
+            for j in range(d):
+                ei = torch.zeros(d, dtype=dtype, device=device); ei[i] = 1
+                ej = torch.zeros(d, dtype=dtype, device=device); ej[j] = 1
+                SWAP += torch.kron(ei[:, None] @ ej[None, :], ej[:, None] @ ei[None, :])
+        C = torch.eye(d*d, dtype=dtype, device=device) - SWAP
+        K = mat_exp_torch(-C / epsilon)  # (d^2, d^2)
+
+        # --- time grid ---
         N = int(self.num_steps)
-        t_vals = torch.linspace(0.0, 1.0, N + 1, device=device)
-        rho_ts = [ (self.t_max - float(t.item())) * rho0 + float(t.item()) * rho1 for t in t_vals ]
+        t_vals = torch.linspace(0.0, self.t_max, N + 1, device=device)
+        rho_ts = (1.0 - t_vals[:, None, None]/self.t_max) * rho0 + t_vals[:, None, None]/self.t_max * rho1  # (N+1, d, d)
 
-        Gamma_list = []
-        L_list = []
-        Id_super = torch.eye(d * d, dtype=dtype, device=device)
+        # rho_a, rho_b for all intervals
+        rho_a = rho_ts[:-1]  # (N, d, d)
+        rho_b = rho_ts[1:]   # (N, d, d)
 
-        for k in range(N):
-            rho_a = rho_ts[k]
-            rho_b = rho_ts[k + 1]
+        # --- initialize U, V for all intervals ---
+        eye_dd = torch.eye(d*d, dtype=dtype, device=device)
+        U = eye_dd.unsqueeze(0).repeat(N, 1, 1)  # (N, d^2, d^2)
+        V = eye_dd.unsqueeze(0).repeat(N, 1, 1)
 
-            U = torch.eye(d * d, dtype=dtype, device=device)
-            V = torch.eye(d * d, dtype=dtype, device=device)
+        log_rho_a = mat_log_torch(rho_a)
+        log_rho_b = mat_log_torch(rho_b)
 
-            log_rho_a = mat_log_torch(rho_a)
-            log_rho_b = mat_log_torch(rho_b)
+        # --- Sinkhorn iterations ---
+        for it in range(max_iter_sinkhorn):
+            Gamma = U @ K.unsqueeze(0) @ V  # (N, d^2, d^2)
+            A = partial_trace_right(Gamma)
+            B = partial_trace_left(Gamma)
 
-            for it in range(max_iter_sinkhorn):
-                Gamma = U @ K @ V
-                A = partial_trace_right(Gamma)
-                B = partial_trace_left(Gamma)
-                err = torch.norm(A - rho_a) + torch.norm(B - rho_b)
-                if err.item() < tol_sinkhorn:
-                    break
-                # update U, V via matrix exponentials
-                logA = mat_log_torch(A)
-                logB = mat_log_torch(B)
-                Delta_left = torch.kron((log_rho_a - logA), torch.eye(d, dtype=dtype, device=device))
-                U = mat_exp_torch(Delta_left) @ U
-                Delta_right = torch.kron(torch.eye(d, dtype=dtype, device=device), (log_rho_b - logB).T)
-                V = V @ mat_exp_torch(Delta_right)
+            err = torch.norm(A - rho_a) + torch.norm(B - rho_b)
+            if err.item() < tol_sinkhorn:
+                break
 
-            # final Gamma_k, ensure Hermitian PSD
-            Gamma_k = herm(U @ K @ V)
-            w, v = torch.linalg.eigh(Gamma_k)
-            w_clamped = torch.clamp(w, min=0.0)
-            Gamma_k = (v * w_clamped.unsqueeze(0)) @ v.conj().transpose(-2, -1)
-            Gamma_list.append(Gamma_k)
+            logA = mat_log_torch(A)
+            logB = mat_log_torch(B)
 
-            # build superoperator S_k from Gamma_k (Choi-like)
-            S_k = torch.zeros((d * d, d * d), dtype=dtype, device=device)
-            for p in range(d):
-                for q in range(d):
-                    E_pq = torch.zeros((d, d), dtype=dtype, device=device)
-                    E_pq[p, q] = 1.0 + 0j
-                    RHS = torch.kron(torch.eye(d, dtype=dtype, device=device), E_pq.T)
-                    tmp = Gamma_k @ RHS
-                    M = partial_trace_right(tmp)
-                    vec_M = M.reshape(d * d)
-                    col_idx = p * d + q
-                    S_k[:, col_idx] = vec_M
+            Delta_left = torch.kron(log_rho_a - logA, torch.eye(d, dtype=dtype, device=device))
+            Delta_left = Delta_left.reshape(N, d*d, d*d)
+            U = mat_exp_torch(Delta_left) @ U
 
-            delta_t = float(self.t_step)
-            L_k = (S_k - Id_super) / delta_t
-            L_list.append(L_k)
+            Delta_right = torch.kron(torch.eye(d, dtype=dtype, device=device), (log_rho_b - logB).transpose(-2, -1))
+            Delta_right = Delta_right.reshape(N, d*d, d*d)
+            V = V @ mat_exp_torch(Delta_right)
 
-        return L_list, Gamma_list, rho_ts
+        # --- finalize Gamma ---
+        Gamma = U @ K.unsqueeze(0) @ V
+        Gamma = herm(Gamma)
+        w, v = torch.linalg.eigh(Gamma)
+        w = torch.clamp(w, min=0.0)
+        Gamma = (v * w.unsqueeze(-2)) @ v.conj().transpose(-2, -1)
+
+        # --- build S_k in batch ---
+        S_k = torch.zeros((N, d*d, d*d), dtype=dtype, device=device)
+        for p in range(d):
+            for q in range(d):
+                E_pq = torch.zeros((d, d), dtype=dtype, device=device)
+                E_pq[p, q] = 1
+                RHS = torch.kron(torch.eye(d, dtype=dtype, device=device), E_pq.T)
+                tmp = Gamma @ RHS.unsqueeze(0)
+                M = partial_trace_right(tmp)
+                vec_M = M.reshape(N, d*d)
+                col_idx = p * d + q
+                S_k[:, :, col_idx] = vec_M
+
+        delta_t = self.t_step if hasattr(self, "t_step") else (1.0 / self.num_steps)
+        Id = torch.eye(d*d, dtype=dtype, device=device)
+        L_list = (S_k - Id.unsqueeze(0)) / delta_t
+
+        # 转成 list 形式保持原接口习惯
+        return list(L_list), list(Gamma), list(rho_ts)
+
 
     # ------------------------------
     # helper: unitary -> choi (torch)
@@ -494,19 +517,6 @@ Note: this script is intended as a compact, runnable *test harness* — tweak
 num_layers, num_ancilla, batch_size, and num_epochs to explore capabilities.
 """
 
-import time
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
-
-# Try to import the QFM class. If it's in the same file the import will fail and
-# we assume the class is already available in the namespace.
-try:
-    from qfm import QFM
-except Exception:
-    # Assume QFM class is defined above or in the same file; nothing else to do.
-    QFM = globals().get('QFM', None)
-
 
 # ------------------------- helpers ---------------------------------
 
@@ -594,128 +604,6 @@ def reduce_system_density_from_full_state(psi_full, num_qubits_system, num_total
 # ------------------------ main test harness --------------------------
 
 def main():
-    # --- test configuration (small to keep runtime reasonable) ---
-    seed = 1234
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    num_qubits = 2                # small system for tests (2 qubits => d_sys=4)
-    batch_size = 8
-
-    # Simple initial distribution: random product states from a small pool
-    input_samples_np = random_product_states(batch_size, num_qubits, seed=seed + 1)
-
-    # Complex target distribution: Haar-random entangled states
-    target_samples_np = random_haar_states(batch_size, 2 ** num_qubits, seed=seed + 2)
-
-    # Instantiate QFM. Keep ancilla and layers small for testing on CPU.
-    if QFM is None:
-        raise RuntimeError("QFM class not found. Please place the QFM class in the same file or make it importable from 'qfm.py'.")
-
-    qfm = QFM(
-        input_samples=input_samples_np,
-        target_samples=target_samples_np,
-        device_class="default.qubit",
-        num_ancilla=1,
-        num_layers=2,
-        t_max=1.0,
-        num_steps=5,
-        learning_rate=1e-2,
-        num_epochs=20,
-        notice=True,
-    )
-
-    print("QFM instantiated: num_qubits=", num_qubits, "num_total_qubits=", qfm.num_total_qubits)
-
-    # Quick initial evaluation
-    with torch.no_grad():
-        try:
-            init_loss = qfm(input_samples=None)  # uses stored input_samples by default
-            print(f"Initial loss (mean Choi distance): {init_loss.item():.6e}")
-        except Exception as e:
-            print("Initial forward failed:", e)
-
-    # --- short training loop ---
-    loss_history = []
-    start_time = time.time()
-    for epoch in range(qfm.num_epochs):
-        qfm.optimizer.zero_grad()
-        loss = qfm()  # forward uses self.input_samples by default
-        loss.backward()
-        qfm.optimizer.step()
-        loss_history.append(loss.item())
-        if (epoch + 1) % max(1, qfm.num_epochs // 10) == 0 or epoch < 5:
-            print(f"Epoch {epoch+1:03d}/{qfm.num_epochs:03d}  loss={loss.item():.6e}")
-    elapsed = time.time() - start_time
-    print(f"Training finished in {elapsed:.1f}s")
-
-    # --- evaluation ---
-    print("\nEvaluation:")
-    # 1) Quantum Sinkhorn -> L_list
-    L_list, Gamma_list, rho_ts = qfm.QuantumSkinhorn()
-    print(f"Computed {len(L_list)} generator superoperators from QuantumSinkhorn.")
-
-    # 2) Choi distances between PQC unitaries and sinkhorn unitaries
-    distances = qfm.compare_unitaries_choi(qfm.input_samples, L_list, norm_type="fro")
-    print("Choi distances per layer (frobenius):", distances)
-
-    # 3) state-level fidelities and trace distances between PQC reduced system states and targets
-    #    get PQC states (may be full-system state vector or system-only depending on PL)
-    pqc_states, U_list = qfm.PQC(qfm.input_samples)
-
-    # ensure pqc_states is a torch tensor
-    if not isinstance(pqc_states, torch.Tensor):
-        pqc_states = torch.as_tensor(pqc_states, dtype=qfm.cfloat, device=qfm.device)
-
-    # if PQC returned only system-sized states, no reduction is needed
-    d_sys = qfm.d_sys
-    total_dim = 2 ** qfm.num_total_qubits
-
-    fidelities = []
-    tdistances = []
-    for i in range(pqc_states.shape[0]):
-        state_i = pqc_states[i].reshape(-1)
-        # reduce if full-system
-        if state_i.numel() == total_dim:
-            rho_sys = reduce_system_density_from_full_state(state_i, qfm.num_qubits, qfm.num_total_qubits)
-        elif state_i.numel() == d_sys:
-            psi_sys = state_i
-            rho_sys = psi_sys.reshape(d_sys, 1) @ psi_sys.conj().reshape(1, d_sys)
-        else:
-            raise RuntimeError("Unexpected state vector size from PQC: ", state_i.numel())
-
-        # target pure state vector
-        psi_target = torch.as_tensor(qfm.target_samples[i], dtype=qfm.cfloat, device=qfm.device).reshape(d_sys, 1)
-        fid = float((psi_target.conj().transpose(-2, -1) @ rho_sys @ psi_target).real.item())
-        fidelities.append(fid)
-
-        # trace distance between rho_sys and target pure density
-        rho_target = psi_target @ psi_target.conj().transpose(-2, -1)
-        tdist = trace_distance(rho_sys.cpu(), rho_target.cpu())
-        tdistances.append(tdist)
-
-    print(f"Average fidelity (PQC reduced -> target): {np.mean(fidelities):.6f}  std {np.std(fidelities):.6f}")
-    print(f"Average trace distance (PQC reduced -> target): {np.mean(tdistances):.6f}  std {np.std(tdistances):.6f}")
-
-    # --- plot loss history ---
-    try:
-        plt.figure(figsize=(5, 3))
-        plt.plot(loss_history, marker="o")
-        plt.xlabel('epoch')
-        plt.ylabel('mean Choi distance (loss)')
-        plt.title('Training loss')
-        plt.tight_layout()
-        plt.show()
-    except Exception:
-        print("Matplotlib not available or running headless; skipping plot.")
-
-    # --- save checkpoint ---
-    try:
-        ckpt_name = 'qfm_test_trained.pt'
-        torch.save({'state_dict': qfm.state_dict(), 'loss_history': loss_history}, ckpt_name)
-        print(f"Saved checkpoint to {ckpt_name}")
-    except Exception as e:
-        print("Failed to save checkpoint:", e)
 
 
 if __name__ == '__main__':
