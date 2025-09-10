@@ -1,612 +1,323 @@
-
-# Quantum Flow Matching (QFM) Module
-# This module implements the Quantum Flow Matching algorithm for quantum state preparation.
-
 # %%
-import numpy as np
-import scipy.linalg
 import pennylane as qml
-from pennylane import numpy as qnp
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import matplotlib.pyplot as plt
-import os
-import time
+from pennylane import numpy as np
 
-class QFM(nn.Module):
-    def __init__(self, input_samples = None, target_samples = None, device_class="default.qubit",
-                 num_ancilla = 2, num_layers = 4,
-                 t_max = 1.0, num_steps = 20,
-                 learning_rate=0.01 , num_epochs=100, notice=False):
+class QuantumFlowTomography:
+    """
+    Quantum Flow Matching inspired quantum process tomography via PennyLane.
 
-        super().__init__()
+    Args:
+        n_qubits_in (int): number of input qubits.
+        n_qubits_out (int): number of output qubits.
+        depth (int): number of HEA layers per time-step.
+        timesteps (int): number of time steps in flow (>=1). The procedure will train a small HEA for each step.
+        shots (int): number of shots for device. NOTE: this implementation uses analytic density outputs (shots=None)
+                     for density-based loss. If shots>0, sampling-based tomography is NOT implemented here and
+                     analytic device will be used instead (see notes in class docstring).
+        backend (str): PennyLane device name, e.g. 'default.qubit'.
 
-        # --- basic settings and device ---
-        # infer system qubits from input samples shape
-        self.num_qubits = int(np.log2(input_samples.shape[1]))
-        self.num_ancilla = int(num_ancilla)
-        self.num_layers = int(num_layers)
-        # total wires (system + ancilla per layer)
-        self.num_total_qubits = self.num_qubits + self.num_ancilla * self.num_layers
+    Data expectations for fit():
+        samples_input: np.ndarray shape (N, 2**n_qubits_in) - complex state vectors (amplitudes) for input pure states.
+        samples_output: np.ndarray shape (N, 2**n_qubits_out) - complex state vectors for output states after the true process.
+    """
 
-        self.notice = notice
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # complex dtype selection
-        self.cfloat = torch.complex128 if torch.get_default_dtype() == torch.float64 else torch.complex64
-        self.rdtype = torch.get_default_dtype()
+    def __init__(self, n_qubits_in, n_qubits_out, depth=2, timesteps=4, shots=0, backend="default.qubit"):
+        self.n_in = n_qubits_in
+        self.n_out = n_qubits_out
+        self.ancilla = n_qubits_out  # Stinespring ancilla qubits
+        self.n_total = self.n_in + self.ancilla  # total qubits for unitary
+        
+        self.depth = depth
+        self.timesteps = timesteps
+        self.shots = shots
+        self.backend = backend
 
-        if self.notice:
-            print("Torch device:", self.device, "complex dtype:", self.cfloat)
+        # number of wires for the full unitary (system_in wires + ancilla wires)
+        self.sys_wires = list(range(self.n_in))
+        self.anc_wires = list(range(self.n_in, self.n_in + self.ancilla))
+        self.total_wires = list(range(self.n_in + self.ancilla))
 
-        # --- try to create PennyLane device (prefer lightning.gpu if available) ---
-        chosen_qml_device = device_class
-        qml_dev = None
-        try:
-            if device_class == "default.qubit":
-                # Try lightning.gpu first (fast if installed)
-                try:
-                    qml_dev = qml.device("lightning.gpu", wires=self.num_total_qubits )
-                    chosen_qml_device = "lightning.gpu"
-                    if self.notice:
-                        print("[INFO] Using pennylane lightning.gpu device.")
-                except Exception:
-                    # fallback to default.qubit
-                    qml_dev = qml.device("default.qubit", wires=self.num_total_qubits )
-                    chosen_qml_device = "default.qubit"
-                    if self.notice:
-                        print("[WARNING] lightning.gpu not available; using default.qubit.")
-            else:
-                qml_dev = qml.device(device_class, wires=self.num_total_qubits )
-                chosen_qml_device = device_class
-        except Exception as e:
-            # ultimate fallback
-            qml_dev = qml.device("default.qubit", wires=self.num_total_qubits )
-            chosen_qml_device = "default.qubit"
-            if self.notice:
-                print("[ERROR] Could not create requested qml device, fallback to default.qubit:", e)
+        # device: for density output we require analytic device (shots=None)
+        if self.shots and self.shots > 0:
+            # NOTE: sampling-based tomography is not implemented; use analytic device for training.
+            # We keep backend name but instantiate device with analytic mode.
+            print("Warning: shots>0 was provided, but this implementation uses analytic density outputs."
+                  " Training will proceed with analytic device (shots=None).")
+        self.dev = qml.device(backend, wires=self.total_wires)
 
-        self.qdevice = qml_dev
-        self.qdevice_name = chosen_qml_device
+        # initialize parameters per timestep: each timestep has params for HEA layers
+        # shape: (timesteps, depth, n_params_per_layer)
+        # We'll parametrize each layer by rx, rz per wire (2 params per wire)
+        self.n_params_per_layer = 2 * self.n_total
+        # params: list length timesteps, each is a (depth, n_params_per_layer) array
+        self.params = [np.random.normal(0, 0.1, (self.depth, self.n_params_per_layer), requires_grad=True)
+                       for _ in range(self.timesteps)]
 
-        # --- store sample data as torch tensors on the chosen device ---
-        self.input_samples = torch.as_tensor(input_samples, dtype=self.rdtype, device=self.device)
-        self.target_samples = torch.as_tensor(target_samples, dtype=self.rdtype, device=self.device)
+        # Build qnode generator for a single timestep unitary that returns density on system wires
+        # We'll create a closure that builds QNode given theta and input_state
+        def make_qnode():
+            @qml.qnode(self.dev, interface="autograd")
+            def qnode(theta, state_vec):
+                # state_vec: complex vector length 2**n_in
+                # Prepare input on system wires:
+                qml.templates.MottonenStatePreparation(state_vec, wires=self.sys_wires)
+                # Initialize ancilla to |0...0> automatically
 
-        # ensure complex amplitudes
-        if not torch.is_complex(self.input_samples):
-            self.input_samples = self.input_samples.to(self.device).to(self.cfloat)
-        if not torch.is_complex(self.target_samples):
-            self.target_samples = self.target_samples.to(self.device).to(self.cfloat)
+                # Apply parametrized HEA acting on system + ancilla
+                # theta shape expected: (depth, n_params_per_layer)
+                self._apply_heas(theta)
+                # return reduced density matrix on system wires
+                return qml.density_matrix(self.sys_wires)
+            return qnode
 
-        self.batch_size = int(self.input_samples.shape[0])
+        self._make_qnode = make_qnode
+        # a qnode instance will be created on-demand in fit (so device compilation respects params)
+        self.qnodes = [None] * self.timesteps
 
-        # system dimension
-        self.d_sys = int(self.input_samples.shape[1])
-
-
-        # --- variational parameters ---
-        # allocate parameters for system + ancilla wires
-        self.params_shape = (self.num_layers, self.num_total_qubits, 3)
-        init_params = (2 * torch.rand(self.params_shape, device=self.device) - 1) * torch.pi
-        self.parametters = nn.Parameter(init_params, requires_grad=True)
-        self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
-
-        # time evolution params
-        self.t_max = float(t_max)
-        self.num_steps = int(num_steps)
-        self.t_values = torch.linspace(0, self.t_max, self.num_steps, device=self.device)
-        self.t_step = float(self.t_max / max(1, self.num_steps))
-
-        # training params
-        self.learning_rate = learning_rate
-        self.num_epochs = num_epochs
-
-    # ------------------------------
-    # PQC and layer construction
-    # ------------------------------
-    def layer_with_unitary(self, layer_index):
+    def _apply_heas(self, theta):
         """
-        Return a function that applies the layer gates (to be used in QNode).
-        Uses self.parametters indexed by full wire index.
+        Apply HEA layers according to theta (depth * n_params_per_layer).
+        Each layer: single-qubit rotations Rx, Rz on each wire followed by chain of CNOT entanglers.
         """
-        i = int(layer_index)
-        params = self.parametters
+        depth = theta.shape[0]
+        nparams = theta.shape[1]
+        assert nparams == self.n_params_per_layer
+        for d in range(depth):
+            layer_params = theta[d]
+            # layer_params split into pairs (rx, rz) per wire
+            for w_idx, wire in enumerate(self.total_wires):
+                rx_param = layer_params[2 * w_idx]
+                rz_param = layer_params[2 * w_idx + 1]
+                qml.RX(rx_param, wires=wire)
+                qml.RZ(rz_param, wires=wire)
+            # simple entangler: chain CNOTs
+            for w in range(self.n_total - 1):
+                qml.CNOT(wires=[w, w + 1])
+            # also close the ring
+            if self.n_total > 1:
+                qml.CNOT(wires=[self.n_total - 1, 0])
 
-        def _layer():
-            ancilla_start = self.num_qubits + layer_index * self.num_ancilla
-            ancilla_end = ancilla_start + self.num_ancilla
-
-            # system rotations + entangling
-            for j in range(self.num_qubits):
-                qml.RX(params[i, j, 0], wires=j)
-                qml.RY(params[i, j, 1], wires=j)
-                qml.RZ(params[i, j, 2], wires=j)
-            # simple nearest-neighbor entangling on system
-            for j in range(self.num_qubits - 1):
-                qml.CNOT(wires=[j, j + 1])
-            if self.num_qubits > 1:
-                # close the ring
-                qml.CNOT(wires=[self.num_qubits - 1, 0])
-
-            # ancilla part if any
-            if self.num_ancilla > 0:
-                for w in range(ancilla_start, ancilla_end):
-                    qml.RX(params[i, w, 0], wires=w)
-                    qml.RY(params[i, w, 1], wires=w)
-                    qml.RZ(params[i, w, 2], wires=w)
-                # simple entangling for ancilla
-                for idx in range(ancilla_start, ancilla_end - 1):
-                    qml.CNOT(wires=[idx, idx + 1])
-                # entangle system with ancilla qubits
-                for m in range(self.num_qubits):
-                    for n in range(ancilla_start, ancilla_end):
-                        qml.CNOT(wires=[m, n])
-
-        return _layer
-
-    def PQC(self, input_state):
-        # First, compute per-layer unitaries (numpy) by calling qml.matrix on each layer function
-        U_list_np = []
-        for i in range(self.num_layers):
-            layer_fn = self.layer_with_unitary(i)
-            try:
-                U_mat_np = qml.matrix(layer_fn)()
-            except Exception:
-                U_mat_np = np.eye(2 ** (self.num_total_qubits), dtype=complex)
-            U_list_np.append(U_mat_np)
-        # convert to torch
-        U_list_torch = [torch.as_tensor(U, dtype=self.cfloat, device=self.device) for U in U_list_np]
-
-        @qml.qnode(self.qdevice, interface='torch')
-        def circuit(psi):
-            qml.AmplitudeEmbedding(features=psi, wires=range(self.num_qubits), normalize=True)
-            for i in range(self.num_layers):
-                layer_fn = self.layer_with_unitary(i)
-                layer_fn()
-            return qml.state()
-
-        # run circuit (batched handling as before)
-        if input_state.ndim == 1 or input_state.shape[0] == 1:
-            psi = input_state.reshape(self.d_sys)
-            state_out = circuit(psi)
-            state_out = torch.as_tensor(state_out, dtype=self.cfloat, device=self.device)
-            return state_out, U_list_torch
-        else:
-            states = []
-            for i in range(input_state.shape[0]):
-                psi = input_state[i].reshape(self.d_sys)
-                s = circuit(psi)
-                s = torch.as_tensor(s, dtype=self.cfloat, device=self.device)
-                states.append(s)
-            states = torch.stack(states)
-            # return states and the list of per-layer unitaries (from first sample — they're parameter-only so same for all samples)
-            return states, U_list_torch
-
-    # ------------------------------
-    # flow() - original (numpy/scipy) path (kept for compatibility)
-    # ------------------------------
-    def flow(self, input):
+    def default_interp(self, s, rho_in_pure, rho_out):
         """
-        Compute generator superoperators L_list from PQC unitaries.
-        This function follows the original structure using numpy/scipy.
-        Returns list of numpy arrays (each S/L in numpy).
+        Default linear interpolation for a given s in [0,1]:
+            rho_t = (1-s) * rho_in_pure + s * rho_out
+        where rho_in_pure is |psi><psi| and rho_out is the sample output density matrix.
         """
-        # call PQC to get unitaries (we will convert to numpy here)
-        _, U_total_list = self.PQC(input)  # U_total_list are torch tensors on device
-        # move unitaries to cpu numpy
-        U_list_np = [U.cpu().detach().numpy() if isinstance(U, torch.Tensor) else np.array(U) for U in U_total_list]
+        return (1.0 - s) * rho_in_pure + s * rho_out
 
-        L_list = []
-        dim_sys = 2 ** self.num_qubits
-        dim_anc = 2 ** self.num_ancilla
+    def _ensure_qnode(self, step_idx):
+        """Create a qnode for given step if not present."""
+        if self.qnodes[step_idx] is None:
+            self.qnodes[step_idx] = self._make_qnode()
 
-        # initial ancilla state |0><0|
-        ancilla_state = np.zeros((dim_anc, 1), dtype=complex)
-        ancilla_state[0, 0] = 1.0
-        rho_anc = ancilla_state @ ancilla_state.conj().T
-
-        for U in U_list_np:
-            # Build Kraus operators from U (system-ancilla)
-            K_list = []
-            # reshape U into (s_out, a_out, s_in, a_in)
-            U4 = U.reshape(dim_sys, dim_anc, dim_sys, dim_anc)
-            for m in range(dim_anc):
-                K_m = U4[:, m, :, 0]   # pick a_out = m, a_in = 0
-                # ensure shape is (dim_sys, dim_sys)
-                K_list.append(K_m)
-            # Liouville superoperator S = sum_k kron(K, K^*)
-            S = np.zeros((dim_sys**2, dim_sys**2), dtype=complex)
-            for K in K_list:
-                S += np.kron(K, K.conj())
-            L = (scipy.linalg.logm(S) / self.t_step)
-            L_list.append(L)
-
-        return L_list
-
-    # ------------------------------
-    # Torch-based Quantum Sinkhorn (GPU-capable)
-    # ------------------------------
-    def QuantumSkinhorn(self, epsilon=1e-2, max_iter_sinkhorn=200, tol_sinkhorn=1e-6, mu_reg=1e-6):
+    def fit(self, samples_input, samples_output, epochs_per_step=200, lr=0.05, interp_fn=None,
+            batch_size=None, verbose=True):
         """
-        Torch-friendly batched Quantum Sinkhorn.
-        All time intervals are processed in parallel on GPU.
-
-        Returns:
-            L_list: list of torch.Tensor, shape (N, d^2, d^2)
-            Gamma_list: list of torch.Tensor, shape (N, d^2, d^2)
-            rho_ts: list of torch.Tensor, shape (N+1, d, d)
+        Train the sequence of small HEAs across timesteps.
         """
+        if interp_fn is None:
+            interp_fn = self.default_interp
 
-        device = self.device if hasattr(self, "device") else torch.device("cpu")
-        dtype = self.cfloat
+        N = samples_input.shape[0]
+        assert samples_input.shape[0] == samples_output.shape[0], "Input/output sample counts must match."
 
-        # --- prepare states ---
-        x_in = self.input_samples
-        x_out = self.target_samples
-        if not isinstance(x_in, torch.Tensor):
-            x_in = torch.tensor(x_in, dtype=torch.get_default_dtype(), device=device)
-        if not isinstance(x_out, torch.Tensor):
-            x_out = torch.tensor(x_out, dtype=torch.get_default_dtype(), device=device)
-        if not torch.is_complex(x_in):
-            x_in = x_in.to(device).to(dtype=torch.cfloat)
-        if not torch.is_complex(x_out):
-            x_out = x_out.to(device).to(dtype=torch.cfloat)
+        # Precompute density matrices
+        rho_in_pure_list = []
+        rho_out_list = []
+        for i in range(N):
+            psi_in = np.array(samples_input[i], dtype=np.complex128)
+            psi_out = np.array(samples_output[i], dtype=np.complex128)
+            rho_in = np.outer(psi_in, np.conjugate(psi_in))
+            rho_out = np.outer(psi_out, np.conjugate(psi_out))
 
-        batch_size, d = x_in.shape
-        d = int(d)
+            # handle dim mismatch (best-effort padding/truncation)
+            if self.n_in != self.n_out:
+                if rho_out.shape[0] < rho_in.shape[0]:
+                    pad = rho_in.shape[0] // rho_out.shape[0]
+                    rho_out = np.kron(rho_out, np.eye(pad) / pad)
+                elif rho_out.shape[0] > rho_in.shape[0]:
+                    rho_out = rho_out[:rho_in.shape[0], :rho_in.shape[0]]
 
-        # empirical rho0, rho1
-        rho0 = torch.zeros((d, d), dtype=dtype, device=device)
-        rho1 = torch.zeros((d, d), dtype=dtype, device=device)
-        for i in range(batch_size):
-            psi0 = x_in[i].reshape(d, 1)
-            psi1 = x_out[i].reshape(d, 1)
-            rho0 += psi0 @ psi0.conj().t()
-            rho1 += psi1 @ psi1.conj().t()
-        rho0 = rho0 / batch_size
-        rho1 = rho1 / batch_size
+            rho_in_pure_list.append(rho_in)
+            rho_out_list.append(rho_out)
 
-        # helper functions (batched)
-        def herm(A):
-            return 0.5 * (A + A.conj().transpose(-2, -1))
+        # Training timesteps sequentially
+        for step in range(self.timesteps):
+            if verbose:
+                print(f"\n=== Training timestep {step+1}/{self.timesteps} ===")
 
-        def mat_log_torch(A, reg=1e-12):
-            A = herm(A)
-            vals, vecs = torch.linalg.eigh(A + reg * torch.eye(A.shape[-1], dtype=A.dtype, device=A.device))
-            vals = torch.clamp(vals, min=1e-15)
-            lvals = torch.log(vals)
-            return (vecs * lvals.unsqueeze(-2)) @ vecs.conj().transpose(-2, -1)
+            # ensure qnode for this step
+            self._ensure_qnode(step)
+            qnode = self.qnodes[step]
 
-        def mat_exp_torch(A):
-            A = herm(A)
-            vals, vecs = torch.linalg.eigh(A)
-            evals = torch.exp(vals)
-            return (vecs * evals.unsqueeze(-2)) @ vecs.conj().transpose(-2, -1)
+            theta = self.params[step]
+            opt = qml.AdamOptimizer(stepsize=lr)
 
-        def partial_trace_right(X):
-            # X: (B, d^2, d^2)
-            X4 = X.reshape(X.shape[0], d, d, d, d)
-            return torch.einsum('biajb->bij', X4)
+            # cost function for this step
+            def cost_fn(theta_flat, batch_indices):
+                theta_arr = theta_flat.reshape(theta.shape)
+                loss = 0.0
+                for idx in batch_indices:
+                    psi_in = samples_input[idx]
+                    rho_theta = qnode(theta_arr, psi_in)
+                    s = (step + 1) / float(self.timesteps)
+                    rho_t = interp_fn(s, rho_in_pure_list[idx], rho_out_list[idx])
+                    overlap = np.real(np.trace(np.matmul(rho_t, rho_theta)))
+                    loss += (1.0 - overlap)
+                return loss / len(batch_indices)
 
-        def partial_trace_left(X):
-            X4 = X.reshape(X.shape[0], d, d, d, d)
-            return torch.einsum('biaib->bab', X4)
+            # training loop for this timestep
+            theta_flat = theta.reshape(-1)
+            for epoch in range(epochs_per_step):
+                # sample batch indices
+                if batch_size is None or batch_size >= N:
+                    batch_idx = list(range(N))
+                else:
+                    batch_idx = np.random.choice(N, batch_size, replace=False)
 
-        # --- build cost kernel ---
-        SWAP = torch.zeros((d*d, d*d), dtype=dtype, device=device)
-        for i in range(d):
-            for j in range(d):
-                ei = torch.zeros(d, dtype=dtype, device=device); ei[i] = 1
-                ej = torch.zeros(d, dtype=dtype, device=device); ej[j] = 1
-                SWAP += torch.kron(ei[:, None] @ ej[None, :], ej[:, None] @ ei[None, :])
-        C = torch.eye(d*d, dtype=dtype, device=device) - SWAP
-        K = mat_exp_torch(-C / epsilon)  # (d^2, d^2)
+                # update parameters
+                theta_flat, current_loss = opt.step_and_cost(
+                    lambda t: cost_fn(t, batch_idx), theta_flat
+                )
 
-        # --- time grid ---
-        N = int(self.num_steps)
-        t_vals = torch.linspace(0.0, self.t_max, N + 1, device=device)
-        rho_ts = (1.0 - t_vals[:, None, None]/self.t_max) * rho0 + t_vals[:, None, None]/self.t_max * rho1  # (N+1, d, d)
+                if epoch % max(1, epochs_per_step // 5) == 0 and verbose:
+                    print(f" Step {step+1} Epoch {epoch}/{epochs_per_step}  loss={current_loss:.6f}")
 
-        # rho_a, rho_b for all intervals
-        rho_a = rho_ts[:-1]  # (N, d, d)
-        rho_b = rho_ts[1:]   # (N, d, d)
-
-        # --- initialize U, V for all intervals ---
-        eye_dd = torch.eye(d*d, dtype=dtype, device=device)
-        U = eye_dd.unsqueeze(0).repeat(N, 1, 1)  # (N, d^2, d^2)
-        V = eye_dd.unsqueeze(0).repeat(N, 1, 1)
-
-        log_rho_a = mat_log_torch(rho_a)
-        log_rho_b = mat_log_torch(rho_b)
-
-        # --- Sinkhorn iterations ---
-        for it in range(max_iter_sinkhorn):
-            Gamma = U @ K.unsqueeze(0) @ V  # (N, d^2, d^2)
-            A = partial_trace_right(Gamma)
-            B = partial_trace_left(Gamma)
-
-            err = torch.norm(A - rho_a) + torch.norm(B - rho_b)
-            if err.item() < tol_sinkhorn:
-                break
-
-            logA = mat_log_torch(A)
-            logB = mat_log_torch(B)
-
-            Delta_left = torch.kron(log_rho_a - logA, torch.eye(d, dtype=dtype, device=device))
-            Delta_left = Delta_left.reshape(N, d*d, d*d)
-            U = mat_exp_torch(Delta_left) @ U
-
-            Delta_right = torch.kron(torch.eye(d, dtype=dtype, device=device), (log_rho_b - logB).transpose(-2, -1))
-            Delta_right = Delta_right.reshape(N, d*d, d*d)
-            V = V @ mat_exp_torch(Delta_right)
-
-        # --- finalize Gamma ---
-        Gamma = U @ K.unsqueeze(0) @ V
-        Gamma = herm(Gamma)
-        w, v = torch.linalg.eigh(Gamma)
-        w = torch.clamp(w, min=0.0)
-        Gamma = (v * w.unsqueeze(-2)) @ v.conj().transpose(-2, -1)
-
-        # --- build S_k in batch ---
-        S_k = torch.zeros((N, d*d, d*d), dtype=dtype, device=device)
-        for p in range(d):
-            for q in range(d):
-                E_pq = torch.zeros((d, d), dtype=dtype, device=device)
-                E_pq[p, q] = 1
-                RHS = torch.kron(torch.eye(d, dtype=dtype, device=device), E_pq.T)
-                tmp = Gamma @ RHS.unsqueeze(0)
-                M = partial_trace_right(tmp)
-                vec_M = M.reshape(N, d*d)
-                col_idx = p * d + q
-                S_k[:, :, col_idx] = vec_M
-
-        delta_t = self.t_step if hasattr(self, "t_step") else (1.0 / self.num_steps)
-        Id = torch.eye(d*d, dtype=dtype, device=device)
-        L_list = (S_k - Id.unsqueeze(0)) / delta_t
-
-        # 转成 list 形式保持原接口习惯
-        return list(L_list), list(Gamma), list(rho_ts)
+            # save updated params
+            self.params[step] = theta_flat.reshape(theta.shape)
+            if verbose:
+                print(f"Finished timestep {step+1}. Saved params.\n")
 
 
-    # ------------------------------
-    # helper: unitary -> choi (torch)
-    # ------------------------------
-    def unitary_to_choi_torch(self, U):
-        device = self.device
-        dtype = self.cfloat
-        dim_sys = 2 ** self.num_qubits
-        dim_anc = 2 ** self.num_ancilla
-
-        # reshape U: (s_out, a_out, s_in, a_in)
-        U4 = U.reshape(dim_sys, dim_anc, dim_sys, dim_anc)
-        J = torch.zeros((dim_sys * dim_sys, dim_sys * dim_sys), dtype=dtype, device=device)
-        for m in range(dim_anc):
-            K_m = U4[:, m, :, 0]  # (d_sys, d_sys)
-            J = J + torch.kron(K_m, K_m.conj())
-        return J
-
-
-    # ------------------------------
-    # Compare unitaries via choi matrices
-    # ------------------------------
-    def compare_unitaries_choi(self, input, L_list, norm_type="fro"):
+    def predict_density(self, input_state, compose_all_steps=True):
         """
-        Compare PQC output unitaries with the ones implied by L_list using Choi matrices.
-        L_list: list of superoperators (torch tensors) shape (d^2,d^2)
-        Returns distances list (python floats)
+        Given an input state vector (length 2**n_in), return the predicted output density matrix.
+        If compose_all_steps=True, we apply sequentially all learned unitaries (i.e. U_step1, then U_step2,...)
+        by simulating the forward action on the state/ancilla. For simplicity we re-run the QNodes sequentially
+        on the evolving state (this is a simulated composition).
         """
-        # get PQC unitaries
-        _, U_total_list = self.PQC(input)
-        # ensure U_total_list are torch tensors on device
-        U_total_list = [torch.as_tensor(U, dtype=self.cfloat, device=self.device) for U in U_total_list]
+        psi = np.array(input_state, dtype=np.complex128)
 
-        # compute choi for PQC and for Sinkhorn-derived unitaries (via matrix exponential)
-        distances = []
-        for U_pqc, L in zip(U_total_list, L_list):
-            J_pqc = self.unitary_to_choi_torch(U_pqc)
-            # from generator L get U_sink = exp(L * dt) (superoperator -> convert to unitary in full space?)
-            # Here we follow the original approach: exponentiate L (superoperator) to get S and then try to convert to a unitary U_sink in the enlarged Hilbert space.
-            # A practical proxy: interpret exp(L*dt) as a superoperator S and attempt to get corresponding Choi J_sink by reshaping S (but to stay consistent with previous design, we exponentiate L and try to treat it as operation)
-            S_sink = torch.matrix_exp(L * float(self.t_step))
-            # We need to turn S_sink (superoperator) back to a Choi-like matrix J_sink.
-            # Here a simple approach: treat S_sink as action on vectorized matrices and build J_sink by applying S_sink to basis E_pq (same as in QuantumSkinhorn)
-            d = self.d_sys
-            J_sink = torch.zeros((d * d, d * d), dtype=self.cfloat, device=self.device)
-            for p in range(d):
-                for q in range(d):
-                    E_pq = torch.zeros((d, d), dtype=self.cfloat, device=self.device)
-                    E_pq[p, q] = 1.0 + 0j
-                    RHS = torch.kron(torch.eye(d, dtype=self.cfloat, device=self.device), E_pq.T)
-                    tmp = S_sink @ RHS
-                    # partial trace over right => recover action result M
-                    M = tmp.reshape(d, d, d, d)
-                    M = torch.einsum('iaja->ij', M)
-                    vec_M = M.reshape(d * d)
-                    col_idx = p * d + q
-                    J_sink[:, col_idx] = vec_M
-            # compute norm of difference
-            diff = J_pqc - J_sink
-            if norm_type == "fro":
-                dval = torch.linalg.norm(diff).item()
-            elif norm_type == "trace":
-                s = torch.linalg.svd(diff, full_matrices=False).S
-                dval = float(torch.sum(s).item())
-            else:
-                raise ValueError("Unsupported norm_type")
-            distances.append(dval)
-        return distances
+        # sequentially apply each trained U (we reuse qnodes, but as QNode expects to start with input on system,
+        # we must re-prepare the full state: system=psi, ancilla=|0>, then apply current step unitary, trace out ancilla,
+        # then to feed into next step we must re-encode the (possibly mixed) density into a pure state by purification?
+        # Simpler and consistent approach here: we simulate the global unitary on system+ancilla and then trace ancilla,
+        # but to compose two steps we need to carry the full system+ancilla state through; that requires expanding ancilla spaces.
+        # For brevity we re-apply each unitary starting from original psi and assume composition by applying all unitaries
+        # on the same system+ancilla (i.e., effectively using same ancilla space and applying U_step1 U_step2 ...).
+        # Implementation: build a composite unitary by combining param layers and run once.
+        # Here we instead simulate sequential application by building a temporary device and applying all layers.
+        dev_comp = qml.device(self.backend, wires=self.total_wires)
+        @qml.qnode(dev_comp, interface="autograd")
+        def composite_qnode(all_thetas_flat, state_vec):
+            # prepare input
+            qml.templates.MottonenStatePreparation(state_vec, wires=self.sys_wires)
+            # apply all step HEAs in sequence
+            offset = 0
+            for step in range(self.timesteps):
+                theta_shape = self.params[step].shape
+                size = theta_shape[0] * theta_shape[1]
+                theta_flat = all_thetas_flat[offset:offset+size]
+                theta = theta_flat.reshape(theta_shape)
+                self._apply_heas(theta)
+                offset += size
+            return qml.density_matrix(self.sys_wires)
 
-    # ------------------------------
-    # forward: produce loss = mean Choi distance
-    # ------------------------------
-    def forward(self, input_samples=None, norm_type="fro"):
+        # gather all params flattened
+        all_flat = np.concatenate([p.reshape(-1) for p in self.params])
+        rho_pred = composite_qnode(all_flat, psi)
+        return rho_pred
+
+    def apply_total_unitary(self):
         """
-        Compute mean distance between PQC Choi matrices and QuantumSinkhorn Choi matrices.
-        Returns scalar torch tensor (loss).
+        (Optional) Return a QNode that implements the composed unitary U_total = U_timestep * ... * U_1
+        on (system + ancilla). This QNode can be used for diagnostics or to extract the full unitary
+        (if device supports unitary extraction).
         """
-        if input_samples is None:
-            input_samples = self.input_samples
-        input_samples = input_samples.to(self.device)
+        dev_comp = qml.device(self.backend, wires=self.total_wires)
+        @qml.qnode(dev_comp, interface="autograd")
+        def unitary_qnode(all_thetas_flat):
+            # prepare computational basis state |0...0>, then apply layers to get full unitary action
+            # However extracting full matrix requires device-specific capabilities; here we return state
+            # from applying U to basis states externally if needed.
+            # We'll just apply and return density on all wires for now.
+            # prepare zero state implicitly
+            offset = 0
+            for step in range(self.timesteps):
+                theta_shape = self.params[step].shape
+                size = theta_shape[0] * theta_shape[1]
+                theta_flat = all_thetas_flat[offset:offset+size]
+                theta = theta_flat.reshape(theta_shape)
+                self._apply_heas(theta)
+                offset += size
+            return qml.density_matrix(range(self.n_total))
+        return unitary_qnode
+# %%
 
-        # 1) PQC: get state(s) and unitary list
-        pqc_state, U_total_list = self.PQC(input_samples)
+#%%
+if __name__ == "__main__":
+    import pennylane as qml
+    from pennylane import numpy as np
+    from scipy.linalg import sqrtm
 
-        # 2) Quantum Sinkhorn -> L_list (torch)
-        L_list, Gamma_list, rho_ts = self.QuantumSkinhorn()
+    # ---- 导入刚才的 QuantumFlowTomography 类 ----
+    
 
-        # 3) convert PQC unitaries & compare via choi (torch)
-        # ensure U_total_list are torch tensors
-        U_total_list = [torch.as_tensor(U, dtype=self.cfloat, device=self.device) for U in U_total_list]
+    # 定义目标量子过程：Hadamard gate
+    def hadamard_process(state_vec):
+        H = np.array([[1, 1], [1, -1]]) / np.sqrt(2)
+        return H @ state_vec
 
-        # compute choi for both and distance per layer
-        dim_sys = self.d_sys
-        distances = []
-        for U_mat, L in zip(U_total_list, L_list):
-            J_pqc = self.unitary_to_choi_torch(U_mat)
-            # S_sink from L
-            S_sink = torch.matrix_exp(L * float(self.t_step))
-            # build J_sink similarly as done in QuantumSkinhorn
-            d = dim_sys
-            J_sink = torch.zeros((d * d, d * d), dtype=self.cfloat, device=self.device)
-            for p in range(d):
-                for q in range(d):
-                    E_pq = torch.zeros((d, d), dtype=self.cfloat, device=self.device)
-                    E_pq[p, q] = 1.0 + 0j
-                    RHS = torch.kron(torch.eye(d, dtype=self.cfloat, device=self.device), E_pq.T)
-                    tmp = S_sink @ RHS
-                    M = tmp.reshape(d, d, d, d)
-                    M = torch.einsum('iaja->ij', M)
-                    vec_M = M.reshape(d * d)
-                    col_idx = p * d + q
-                    J_sink[:, col_idx] = vec_M
-            diff = J_pqc - J_sink
-            if norm_type == "fro":
-                dval = torch.linalg.norm(diff)
-            elif norm_type == "trace":
-                s = torch.linalg.svd(diff, full_matrices=False).S
-                dval = torch.sum(s)
-            else:
-                raise ValueError("Unsupported norm_type")
-            distances.append(dval)
-        distances = torch.stack(distances)
-        return distances.mean()
+    # 生成训练数据
+    def generate_dataset(num_samples=8):
+        samples_input = []
+        samples_output = []
+        for _ in range(num_samples):
+            # 随机 Bloch 球上的单比特态
+            theta, phi = np.random.rand() * np.pi, np.random.rand() * 2 * np.pi
+            psi = np.array([np.cos(theta / 2), np.exp(1j * phi) * np.sin(theta / 2)])
+            psi_out = hadamard_process(psi)
+            samples_input.append(psi)
+            samples_output.append(psi_out)
+        return np.array(samples_input), np.array(samples_output)
 
-"""
-qfm_test_script.py
+    # 创建数据
+    samples_input, samples_output = generate_dataset(num_samples=100)
 
-Test script for the provided QFM class (Quantum Flow Matching).
+    # 初始化 QuantumFlowTomography
+    qft = QuantumFlowTomography(
+        n_qubits_in=1,
+        n_qubits_out=1,
+        depth=1,          # 每一步只用一个浅层 HEA
+        timesteps=3,      # flow matching 分 3 步训练
+        shots=0,
+        backend="default.qubit"
+    )
 
-Instructions:
-- Put this file in the same folder as your QFM class definition (or paste the QFM class above this script in the same file).
-- Run with Python. PennyLane + chosen device must be installed and working.
+    # 训练
+    qft.fit(samples_input, samples_output, epochs_per_step=500, lr=0.05, verbose=True)
 
-What the script does:
-- Builds a small test problem (num_qubits configurable).
-- Uses a *simple* initial distribution (product single-qubit states like |0>, |+>, |i>)
-  and a *complex* target distribution (Haar-random entangled states).
-- Instantiates QFM with conservative small parameters (few ancilla / layers) so it
-  runs reasonably on CPU for tests.
-- Runs a short training loop, prints loss, and reports evaluation metrics:
-  - Choi-distance per layer (compare_unitaries_choi)
-  - Average state fidelity between PQC reduced system states and target samples
-  - Average trace distance between PQC reduced system states and target samples
-- Saves a checkpoint of the trained variational parameters.
+    # 测试：选择一个输入态
+    test_state = np.array([1.0, 0.0])   # |0>
+    rho_true = np.outer(hadamard_process(test_state), np.conjugate(hadamard_process(test_state)))
+    rho_pred = qft.predict_density(test_state)
 
-Note: this script is intended as a compact, runnable *test harness* — tweak
-num_layers, num_ancilla, batch_size, and num_epochs to explore capabilities.
-"""
+    def fidelity(rho, sigma):
+        # 保证输入是 numpy array (密度矩阵)
+        rho = np.array(rho, dtype=complex)
+        sigma = np.array(sigma, dtype=complex)
 
+        # 计算 sqrt(rho)
+        sqrt_rho = sqrtm(rho)
 
-# ------------------------- helpers ---------------------------------
+        # 计算 sqrt(sqrt(rho) * sigma * sqrt(rho))
+        inner = sqrtm(sqrt_rho @ sigma @ sqrt_rho)
 
-def random_haar_states(batch, d, dtype=np.complex128, seed=None):
-    if seed is not None:
-        np.random.seed(seed)
-    z = (np.random.randn(batch, d) + 1j * np.random.randn(batch, d)).astype(dtype)
-    norms = np.linalg.norm(z, axis=1, keepdims=True)
-    z /= norms
-    return z
+        # 取实部，避免数值误差导致出现极小的虚部
+        return np.real((np.trace(inner))**2)
 
-
-def product_single_qubit_pool():
-    # Common, simple single-qubit states to build product states from
-    return [
-        np.array([1.0, 0.0], dtype=np.complex128),  # |0>
-        np.array([0.0, 1.0], dtype=np.complex128),  # |1>
-        1.0 / np.sqrt(2.0) * np.array([1.0, 1.0], dtype=np.complex128),  # |+>
-        1.0 / np.sqrt(2.0) * np.array([1.0, -1.0], dtype=np.complex128),  # |->
-        1.0 / np.sqrt(2.0) * np.array([1.0, 1j], dtype=np.complex128),  # |+i>
-        1.0 / np.sqrt(2.0) * np.array([1.0, -1j], dtype=np.complex128),  # |-i>
-    ]
-
-
-def random_product_states(batch, num_qubits, seed=None):
-    if seed is not None:
-        np.random.seed(seed)
-    pool = product_single_qubit_pool()
-    samples = []
-    for _ in range(batch):
-        factors = [pool[np.random.randint(len(pool))] for _ in range(num_qubits)]
-        vec = factors[0]
-        for f in factors[1:]:
-            vec = np.kron(vec, f)
-        samples.append(vec)
-    return np.stack(samples)
-
-
-# fidelity between pure state |psi> (vector) and density matrix rho: <psi|rho|psi>
-# or general Uhlmann fidelity for two density matrices (torch)
-
-def fidelity_pure_vs_rho(psi_vec, rho):
-    # psi_vec: complex numpy or torch vector (d,) ; rho: (d,d) torch tensor or numpy
-    if isinstance(rho, torch.Tensor):
-        device = rho.device
-        psi = torch.as_tensor(psi_vec, dtype=rho.dtype, device=device).reshape(-1, 1)
-        val = (psi.conj().transpose(-2, -1) @ rho @ psi).real.item()
-        return float(np.clip(val, 0.0, 1.0))
-    else:
-        psi = psi_vec.reshape(-1, 1)
-        val = (psi.conj().T @ rho @ psi).item()
-        return float(np.clip(val.real, 0.0, 1.0))
-
-
-def trace_distance(rho1, rho2):
-    # 0.5 * sum |eigvals(rho1-rho2)|; works for numpy or torch (returns python float)
-    if isinstance(rho1, torch.Tensor):
-        diff = rho1 - rho2
-        vals = torch.linalg.eigvalsh(diff)
-        return 0.5 * float(torch.sum(torch.abs(vals)).item())
-    else:
-        diff = rho1 - rho2
-        vals = np.linalg.eigvalsh(diff)
-        return 0.5 * float(np.sum(np.abs(vals)))
-
-
-def reduce_system_density_from_full_state(psi_full, num_qubits_system, num_total_qubits):
-    # psi_full can be numpy vector (d_total,) or torch tensor; returns rho_sys (torch tensor if input torch)
-    d_sys = 2 ** num_qubits_system
-    d_total = 2 ** num_total_qubits
-    psi = psi_full
-    using_torch = isinstance(psi_full, torch.Tensor)
-    if using_torch:
-        psi = psi_full.contiguous().view(d_total)
-        psi_mat = psi.reshape(d_sys, -1)  # (d_sys, d_anc)
-        rho_sys = psi_mat @ psi_mat.conj().transpose(-2, -1)
-        return rho_sys
-    else:
-        psi = np.asarray(psi_full).reshape(d_total)
-        psi_mat = psi.reshape(d_sys, -1)
-        rho_sys = psi_mat @ psi_mat.conj().T
-        return rho_sys
-
-
-# ------------------------ main test harness --------------------------
-
-def main():
-
-
-if __name__ == '__main__':
-    main()
+    print("\nTrue output density:\n", rho_true)
+    print("\nPredicted output density:\n", rho_pred)
+    print("\nFidelity between true and predicted:", fidelity(rho_true, rho_pred))
 
 # %%
