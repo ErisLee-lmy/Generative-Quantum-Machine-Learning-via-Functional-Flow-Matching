@@ -1,323 +1,206 @@
-# %%
 import pennylane as qml
 from pennylane import numpy as np
-
-class QuantumFlowTomography:
-    """
-    Quantum Flow Matching inspired quantum process tomography via PennyLane.
-
-    Args:
-        n_qubits_in (int): number of input qubits.
-        n_qubits_out (int): number of output qubits.
-        depth (int): number of HEA layers per time-step.
-        timesteps (int): number of time steps in flow (>=1). The procedure will train a small HEA for each step.
-        shots (int): number of shots for device. NOTE: this implementation uses analytic density outputs (shots=None)
-                     for density-based loss. If shots>0, sampling-based tomography is NOT implemented here and
-                     analytic device will be used instead (see notes in class docstring).
-        backend (str): PennyLane device name, e.g. 'default.qubit'.
-
-    Data expectations for fit():
-        samples_input: np.ndarray shape (N, 2**n_qubits_in) - complex state vectors (amplitudes) for input pure states.
-        samples_output: np.ndarray shape (N, 2**n_qubits_out) - complex state vectors for output states after the true process.
-    """
-
-    def __init__(self, n_qubits_in, n_qubits_out, depth=2, timesteps=4, shots=0, backend="default.qubit"):
-        self.n_in = n_qubits_in
-        self.n_out = n_qubits_out
-        self.ancilla = n_qubits_out  # Stinespring ancilla qubits
-        self.n_total = self.n_in + self.ancilla  # total qubits for unitary
+from tqdm import tqdm
         
-        self.depth = depth
-        self.timesteps = timesteps
-        self.shots = shots
-        self.backend = backend
+class QFM():
+    def __init__(self, input_samples, output_samples, n_ancilla=3, num_time_steps=3, depth_per_time_step=3):
+        """Quantum Flow Model (QFM) for learning time evolution.
 
-        # number of wires for the full unitary (system_in wires + ancilla wires)
-        self.sys_wires = list(range(self.n_in))
-        self.anc_wires = list(range(self.n_in, self.n_in + self.ancilla))
-        self.total_wires = list(range(self.n_in + self.ancilla))
-
-        # device: for density output we require analytic device (shots=None)
-        if self.shots and self.shots > 0:
-            # NOTE: sampling-based tomography is not implemented; use analytic device for training.
-            # We keep backend name but instantiate device with analytic mode.
-            print("Warning: shots>0 was provided, but this implementation uses analytic density outputs."
-                  " Training will proceed with analytic device (shots=None).")
-        self.dev = qml.device(backend, wires=self.total_wires)
-
-        # initialize parameters per timestep: each timestep has params for HEA layers
-        # shape: (timesteps, depth, n_params_per_layer)
-        # We'll parametrize each layer by rx, rz per wire (2 params per wire)
-        self.n_params_per_layer = 2 * self.n_total
-        # params: list length timesteps, each is a (depth, n_params_per_layer) array
-        self.params = [np.random.normal(0, 0.1, (self.depth, self.n_params_per_layer), requires_grad=True)
-                       for _ in range(self.timesteps)]
-
-        # Build qnode generator for a single timestep unitary that returns density on system wires
-        # We'll create a closure that builds QNode given theta and input_state
-        def make_qnode():
-            @qml.qnode(self.dev, interface="autograd")
-            def qnode(theta, state_vec):
-                # state_vec: complex vector length 2**n_in
-                # Prepare input on system wires:
-                qml.templates.MottonenStatePreparation(state_vec, wires=self.sys_wires)
-                # Initialize ancilla to |0...0> automatically
-
-                # Apply parametrized HEA acting on system + ancilla
-                # theta shape expected: (depth, n_params_per_layer)
-                self._apply_heas(theta)
-                # return reduced density matrix on system wires
-                return qml.density_matrix(self.sys_wires)
-            return qnode
-
-        self._make_qnode = make_qnode
-        # a qnode instance will be created on-demand in fit (so device compilation respects params)
-        self.qnodes = [None] * self.timesteps
-
-    def _apply_heas(self, theta):
+        Args:
+            input_samples (array[float]): Array of shape (num_samples, dim_Hilbert_space) with initial states.
+            output_samples (array[float]): Array of shape (num_samples, dim_Hilbert_space) with target states.
+            num_time_steps (int): Number of time steps to model.
+            depth_per_time_step (int): Depth of the PQC for each time step.
         """
-        Apply HEA layers according to theta (depth * n_params_per_layer).
-        Each layer: single-qubit rotations Rx, Rz on each wire followed by chain of CNOT entanglers.
+        
+        self.input_samples = input_samples
+        self.output_samples = output_samples
+        self.num_time_steps = num_time_steps
+        self.depth_per_time_step = depth_per_time_step
+        
+        assert input_samples.shape[0] == output_samples.shape[0], "Input and output samples must have the same number of samples."
+        assert input_samples.shape[1] == output_samples.shape[1], "Input and output samples must have the same number of features."
+
+        self.n_input = int(np.log2(input_samples.shape[1]))
+        self.n_output = int(np.log2(input_samples.shape[1]))
+
+        self.n_ancilla = n_ancilla
+        
+        self.num_wires = 2 * self.n_input + self.n_ancilla + 1 # add ancilla qubits to approximate non-unitary evolution
+        
+        
+        # Define wire indices
+        self.wires_sys = range(self.n_input)
+        self.wires_anc = range(self.n_input, self.n_input + self.n_ancilla)
+        self.wires_all = range(self.n_input + self.n_ancilla)
+        self.wires_target = range(self.n_input + self.n_ancilla, self.num_wires-1)
+        self.swap_test_wires = [self.num_wires-1]  # Ancilla wire for swap test
+        
+        # Initialize parameters for the PQC
+        self.parameters = np.random.normal(-0.1, 0.1, 
+                                            (num_time_steps, depth_per_time_step, self.num_wires, 3), 
+                                            requires_grad=True)
+        
+        # Define the quantum device
+        self.dev = qml.device("lightning.qubit", wires=self.num_wires) #+n_input + 1  for swap-test
+        
+        # Define the quantum node of over all time steps
+        @qml.qnode(self.dev, interface='autograd',  diff_method='adjoint')
+        def circuit(params, x, y):
+            '''
+            Quantum circuit for a single time step.
+            Args:
+                params (array[float]): Parameters for the PQC.
+                t (int): Current time step index.
+                x (array[float]): Input state vector.
+                y (array[float]): Target state vector.
+            Returns:
+                float: fidelity between the generated state and the target state.
+            '''
+            qml.templates.MottonenStatePreparation(x, wires=self.wires_sys)
+            qml.templates.MottonenStatePreparation(y, wires=self.wires_target)
+            for t in range(num_time_steps):
+                self.PQC(params, time_step_index=t, depth=self.depth_per_time_step)
+            
+            # Swap test
+            qml.Hadamard(wires=self.num_wires-1)
+            for i in range(self.n_input):
+                qml.CSWAP([self.num_wires-1, self.wires_sys[i], self.wires_target[i]])
+            qml.Hadamard(wires=self.num_wires-1)
+            
+            result = qml.expval(qml.PauliZ(self.num_wires-1))
+            return result
+        self.circuit = circuit
+        
+        
+    def PQC(self, parameters, time_step_index, depth=3):
+        """Parameterized Quantum Circuit (PQC) for time evolution.
+
+        Args:
+            parameters (array[float]): Array of shape (depth, len(wires), 2) containing rotation angles.
+            wires (list[int]): List of wire indices to apply the circuit on.
+            time_step_index (int): Index of the current time step.
+            depth (int): Number of layers in the PQC.
         """
-        depth = theta.shape[0]
-        nparams = theta.shape[1]
-        assert nparams == self.n_params_per_layer
-        for d in range(depth):
-            layer_params = theta[d]
-            # layer_params split into pairs (rx, rz) per wire
-            for w_idx, wire in enumerate(self.total_wires):
-                rx_param = layer_params[2 * w_idx]
-                rz_param = layer_params[2 * w_idx + 1]
-                qml.RX(rx_param, wires=wire)
-                qml.RZ(rz_param, wires=wire)
-            # simple entangler: chain CNOTs
-            for w in range(self.n_total - 1):
-                qml.CNOT(wires=[w, w + 1])
-            # also close the ring
-            if self.n_total > 1:
-                qml.CNOT(wires=[self.n_total - 1, 0])
-
-    def default_interp(self, s, rho_in_pure, rho_out):
-        """
-        Default linear interpolation for a given s in [0,1]:
-            rho_t = (1-s) * rho_in_pure + s * rho_out
-        where rho_in_pure is |psi><psi| and rho_out is the sample output density matrix.
-        """
-        return (1.0 - s) * rho_in_pure + s * rho_out
-
-    def _ensure_qnode(self, step_idx):
-        """Create a qnode for given step if not present."""
-        if self.qnodes[step_idx] is None:
-            self.qnodes[step_idx] = self._make_qnode()
-
-    def fit(self, samples_input, samples_output, epochs_per_step=200, lr=0.05, interp_fn=None,
-            batch_size=None, verbose=True):
-        """
-        Train the sequence of small HEAs across timesteps.
-        """
-        if interp_fn is None:
-            interp_fn = self.default_interp
-
-        N = samples_input.shape[0]
-        assert samples_input.shape[0] == samples_output.shape[0], "Input/output sample counts must match."
-
-        # Precompute density matrices
-        rho_in_pure_list = []
-        rho_out_list = []
-        for i in range(N):
-            psi_in = np.array(samples_input[i], dtype=np.complex128)
-            psi_out = np.array(samples_output[i], dtype=np.complex128)
-            rho_in = np.outer(psi_in, np.conjugate(psi_in))
-            rho_out = np.outer(psi_out, np.conjugate(psi_out))
-
-            # handle dim mismatch (best-effort padding/truncation)
-            if self.n_in != self.n_out:
-                if rho_out.shape[0] < rho_in.shape[0]:
-                    pad = rho_in.shape[0] // rho_out.shape[0]
-                    rho_out = np.kron(rho_out, np.eye(pad) / pad)
-                elif rho_out.shape[0] > rho_in.shape[0]:
-                    rho_out = rho_out[:rho_in.shape[0], :rho_in.shape[0]]
-
-            rho_in_pure_list.append(rho_in)
-            rho_out_list.append(rho_out)
-
-        # Training timesteps sequentially
-        for step in range(self.timesteps):
-            if verbose:
-                print(f"\n=== Training timestep {step+1}/{self.timesteps} ===")
-
-            # ensure qnode for this step
-            self._ensure_qnode(step)
-            qnode = self.qnodes[step]
-
-            theta = self.params[step]
-            opt = qml.AdamOptimizer(stepsize=lr)
-
-            # cost function for this step
-            def cost_fn(theta_flat, batch_indices):
-                theta_arr = theta_flat.reshape(theta.shape)
-                loss = 0.0
-                for idx in batch_indices:
-                    psi_in = samples_input[idx]
-                    rho_theta = qnode(theta_arr, psi_in)
-                    s = (step + 1) / float(self.timesteps)
-                    rho_t = interp_fn(s, rho_in_pure_list[idx], rho_out_list[idx])
-                    overlap = np.real(np.trace(np.matmul(rho_t, rho_theta)))
-                    loss += (1.0 - overlap)
-                return loss / len(batch_indices)
-
-            # training loop for this timestep
-            theta_flat = theta.reshape(-1)
-            for epoch in range(epochs_per_step):
-                # sample batch indices
-                if batch_size is None or batch_size >= N:
-                    batch_idx = list(range(N))
-                else:
-                    batch_idx = np.random.choice(N, batch_size, replace=False)
-
-                # update parameters
-                theta_flat, current_loss = opt.step_and_cost(
-                    lambda t: cost_fn(t, batch_idx), theta_flat
-                )
-
-                if epoch % max(1, epochs_per_step // 5) == 0 and verbose:
-                    print(f" Step {step+1} Epoch {epoch}/{epochs_per_step}  loss={current_loss:.6f}")
-
-            # save updated params
-            self.params[step] = theta_flat.reshape(theta.shape)
-            if verbose:
-                print(f"Finished timestep {step+1}. Saved params.\n")
-
-
-    def predict_density(self, input_state, compose_all_steps=True):
-        """
-        Given an input state vector (length 2**n_in), return the predicted output density matrix.
-        If compose_all_steps=True, we apply sequentially all learned unitaries (i.e. U_step1, then U_step2,...)
-        by simulating the forward action on the state/ancilla. For simplicity we re-run the QNodes sequentially
-        on the evolving state (this is a simulated composition).
-        """
-        psi = np.array(input_state, dtype=np.complex128)
-
-        # sequentially apply each trained U (we reuse qnodes, but as QNode expects to start with input on system,
-        # we must re-prepare the full state: system=psi, ancilla=|0>, then apply current step unitary, trace out ancilla,
-        # then to feed into next step we must re-encode the (possibly mixed) density into a pure state by purification?
-        # Simpler and consistent approach here: we simulate the global unitary on system+ancilla and then trace ancilla,
-        # but to compose two steps we need to carry the full system+ancilla state through; that requires expanding ancilla spaces.
-        # For brevity we re-apply each unitary starting from original psi and assume composition by applying all unitaries
-        # on the same system+ancilla (i.e., effectively using same ancilla space and applying U_step1 U_step2 ...).
-        # Implementation: build a composite unitary by combining param layers and run once.
-        # Here we instead simulate sequential application by building a temporary device and applying all layers.
-        dev_comp = qml.device(self.backend, wires=self.total_wires)
-        @qml.qnode(dev_comp, interface="autograd")
-        def composite_qnode(all_thetas_flat, state_vec):
-            # prepare input
-            qml.templates.MottonenStatePreparation(state_vec, wires=self.sys_wires)
-            # apply all step HEAs in sequence
-            offset = 0
-            for step in range(self.timesteps):
-                theta_shape = self.params[step].shape
-                size = theta_shape[0] * theta_shape[1]
-                theta_flat = all_thetas_flat[offset:offset+size]
-                theta = theta_flat.reshape(theta_shape)
-                self._apply_heas(theta)
-                offset += size
-            return qml.density_matrix(self.sys_wires)
-
-        # gather all params flattened
-        all_flat = np.concatenate([p.reshape(-1) for p in self.params])
-        rho_pred = composite_qnode(all_flat, psi)
-        return rho_pred
-
-    def apply_total_unitary(self):
-        """
-        (Optional) Return a QNode that implements the composed unitary U_total = U_timestep * ... * U_1
-        on (system + ancilla). This QNode can be used for diagnostics or to extract the full unitary
-        (if device supports unitary extraction).
-        """
-        dev_comp = qml.device(self.backend, wires=self.total_wires)
-        @qml.qnode(dev_comp, interface="autograd")
-        def unitary_qnode(all_thetas_flat):
-            # prepare computational basis state |0...0>, then apply layers to get full unitary action
-            # However extracting full matrix requires device-specific capabilities; here we return state
-            # from applying U to basis states externally if needed.
-            # We'll just apply and return density on all wires for now.
-            # prepare zero state implicitly
-            offset = 0
-            for step in range(self.timesteps):
-                theta_shape = self.params[step].shape
-                size = theta_shape[0] * theta_shape[1]
-                theta_flat = all_thetas_flat[offset:offset+size]
-                theta = theta_flat.reshape(theta_shape)
-                self._apply_heas(theta)
-                offset += size
-            return qml.density_matrix(range(self.n_total))
-        return unitary_qnode
-# %%
-
-#%%
-if __name__ == "__main__":
-    import pennylane as qml
-    from pennylane import numpy as np
-    from scipy.linalg import sqrtm
-
-    # ---- 导入刚才的 QuantumFlowTomography 类 ----
+        wires = range(self.n_input + self.n_ancilla)
+        
+        for depth_index in range(depth):
+            for wire in wires:
+                qml.RX(parameters[time_step_index, depth_index, wire, 0], wires=wire)
+                qml.RY(parameters[time_step_index, depth_index, wire, 1], wires=wire)
+                qml.RZ(parameters[time_step_index, depth_index, wire, 2], wires=wire)
+            for i in range(1, len(wires)):
+                qml.CNOT(wires=[wires[i], wires[i - 1]])
+            qml.CNOT(wires=[wires[0], wires[-1]])
     
+    def Interpolate(self, input, output, t_array):
+        '''Limear interpolation between input and output states.
+        Args:
+            input (array[float]): Array of shape (num_samples, num_features) with initial states.
+            output (array[float]): Array of shape (num_samples, num_features) with target states.
+            t_array (array[float]): Array of time steps between 0 and 1.
+        Returns:
+            array[float]: Array of shape (len(t_array), num_samples, num_features) with interpolated states.
+        '''
+        
+        if len(t_array) == 1:
+            t_array = np.array([1.0])
+        
+        targets = np.zeros((len(t_array), input.shape[0], input.shape[1]))
+        
+        for i in range(len(t_array)):
+            targets[i, :, :] = (1 - t_array[i]) * input + t_array[i] * output
+            targets[i, :, :] = targets[i, :, :] / np.linalg.norm(targets[i, :, :], axis=1, keepdims=True)
+        return targets
+        
+    
+    def cost(self, params, t_index, x, y):
+        
+        
+        @qml.qnode(self.dev, interface='autograd', diff_method='best')
+        def ciruit(params):
+            qml.templates.MottonenStatePreparation(x, wires=self.wires_sys)
+                    
+            qml.templates.MottonenStatePreparation(y, wires=self.wires_target)
+            for _ in range(t_index + 1):
+                self.PQC(params, time_step_index=_, depth=self.depth_per_time_step)
+            
+            # Swap test
+            qml.Hadamard(wires=self.num_wires-1)
+            for i in range(self.n_input):
+                qml.CSWAP([self.num_wires-1, self.wires_sys[i], self.wires_target[i]])
+            qml.Hadamard(wires=self.num_wires-1)
+            
+            result = qml.expval(qml.Identity(self.num_wires-1) - qml.PauliZ(self.num_wires-1))
+            return result
+        
+        return ciruit(params)
+    
+    def fit(self, epochs=20, batch_size=5, learning_rate=0.01):
+        """Train the QFM using the provided input and output samples.
 
-    # 定义目标量子过程：Hadamard gate
-    def hadamard_process(state_vec):
-        H = np.array([[1, 1], [1, -1]]) / np.sqrt(2)
-        return H @ state_vec
+        Args:
+            epochs (int): Number of training epochs.
+            batch_size (int): Size of each training batch.
+            learning_rate (float): Learning rate for the optimizer.
+        """
+        opt = qml.QNGOptimizer() 
+        #qml.AdamOptimizer(stepsize=learning_rate)
+        
+        # iterpolate targets for each time step
+        num_samples = self.input_samples.shape[0]
+        targets = self.Interpolate(self.input_samples, self.output_samples, np.linspace(0, 1, self.num_time_steps + 1, endpoint=True)[1::])
+        
+        # initialize input
+        input = self.input_samples
+        
+        # Define cost function for optimization
 
-    # 生成训练数据
-    def generate_dataset(num_samples=8):
-        samples_input = []
-        samples_output = []
-        for _ in range(num_samples):
-            # 随机 Bloch 球上的单比特态
-            theta, phi = np.random.rand() * np.pi, np.random.rand() * 2 * np.pi
-            psi = np.array([np.cos(theta / 2), np.exp(1j * phi) * np.sin(theta / 2)])
-            psi_out = hadamard_process(psi)
-            samples_input.append(psi)
-            samples_output.append(psi_out)
-        return np.array(samples_input), np.array(samples_output)
+        
+        for t_index in range(self.num_time_steps):
+            print(f"Training time step {t_index+1}/{self.num_time_steps}")
+            input = self.input_samples
+            target = targets[t_index]
+            for epoch in range(epochs):
+                # Shuffle the data
+                indices = np.random.permutation(num_samples)
+                input_shuffled = input[indices]
+                target_shuffled = target[indices]
+                
+                for start in tqdm(range(0, num_samples, batch_size),
+                                            desc=f"Epoch {epoch+1}/{epochs}",
+                                            leave=False):
+                    end = start + batch_size
+                    x_batch = input_shuffled[start:end]
+                    y_batch = target_shuffled[start:end]
+                    
+                    if len(x_batch) == 0:
+                        continue  # skip empty batch
+                    
+                    x = np.mean(x_batch, axis=0) 
+                    y = np.mean(y_batch, axis=0) 
 
-    # 创建数据
-    samples_input, samples_output = generate_dataset(num_samples=100)
+                    # cost_fn = partial(self.circuit_per_time_step, t=t_index, x=x, y=y)
+                    @qml.qnode(self.dev, interface='autograd', diff_method='best')
+                    def cost(params):
+                        qml.templates.MottonenStatePreparation(x, wires=self.wires_sys)
+                        for _ in range(t_index + 1):
+                            self.PQC(params, time_step_index=_, depth=self.depth_per_time_step)
+                                                       
+                        qml.templates.MottonenStatePreparation(y, wires=self.wires_target) 
+                        
+                        # Swap test
+                        qml.Hadamard(wires=self.num_wires-1)
+                        for i in range(self.n_input):
+                            qml.CSWAP([self.num_wires-1, self.wires_sys[i], self.wires_target[i]])
+                        qml.Hadamard(wires=self.num_wires-1)
+                        
+                        loss_operator = qml.Identity(self.num_wires-1) - qml.PauliZ(self.num_wires-1)
+                        result = qml.expval(loss_operator)
+                        return result
 
-    # 初始化 QuantumFlowTomography
-    qft = QuantumFlowTomography(
-        n_qubits_in=1,
-        n_qubits_out=1,
-        depth=1,          # 每一步只用一个浅层 HEA
-        timesteps=3,      # flow matching 分 3 步训练
-        shots=0,
-        backend="default.qubit"
-    )
-
-    # 训练
-    qft.fit(samples_input, samples_output, epochs_per_step=500, lr=0.05, verbose=True)
-
-    # 测试：选择一个输入态
-    test_state = np.array([1.0, 0.0])   # |0>
-    rho_true = np.outer(hadamard_process(test_state), np.conjugate(hadamard_process(test_state)))
-    rho_pred = qft.predict_density(test_state)
-
-    def fidelity(rho, sigma):
-        # 保证输入是 numpy array (密度矩阵)
-        rho = np.array(rho, dtype=complex)
-        sigma = np.array(sigma, dtype=complex)
-
-        # 计算 sqrt(rho)
-        sqrt_rho = sqrtm(rho)
-
-        # 计算 sqrt(sqrt(rho) * sigma * sqrt(rho))
-        inner = sqrtm(sqrt_rho @ sigma @ sqrt_rho)
-
-        # 取实部，避免数值误差导致出现极小的虚部
-        return np.real((np.trace(inner))**2)
-
-    print("\nTrue output density:\n", rho_true)
-    print("\nPredicted output density:\n", rho_pred)
-    print("\nFidelity between true and predicted:", fidelity(rho_true, rho_pred))
-
-# %%
+                    
+ 
+                    self.parameters = opt.step(cost, self.parameters)
+            
+            print(f"Cost after time step {t_index+1}: {self.cost(self.parameters, t_index, np.mean(input,axis=0), np.mean(target,axis=0))}")
